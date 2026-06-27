@@ -132,6 +132,10 @@ static void update_mouse(Console *s, int rel, int x, int y, int cnfgmask)
 		if (s->lastx > 2048) s->lastx = 2048;
 		if (s->lasty > 2048) s->lasty = 2048;
 	} else {
+		if (x < 0) x = 0;
+		if (y < 0) y = 0;
+		if (x > s->width - 1) x = s->width - 1;
+		if (y > s->height - 1) y = s->height - 1;
 		if (s->lastx < 0 || s->lasty < 0) {
 			s->lastx = x;
 			s->lasty = y;
