@@ -370,6 +370,16 @@ uint8_t cmos_set(void *cmos, int addr, uint8_t val)
 	return val;
 }
 
+void cmos_update_checksum(void *cmos)
+{
+	CMOS *s = cmos;
+	uint16_t sum = 0;
+	for (int i = 0x10; i <= 0x2d; i++)
+		sum += s->data[i];
+	s->data[0x2e] = sum >> 8;
+	s->data[0x2f] = sum;
+}
+
 struct fdfmt {
 	uint8_t sectors;
 	uint8_t tracks;

@@ -33,6 +33,7 @@
 
 //#define DEBUG_IDE
 //#define DEBUG_IDE_ATAPI
+//#define DEBUG_IDE_EXTENDED
 
 /* Bits of HD_STATUS */
 #define ERR_STAT		0x01
@@ -579,6 +580,20 @@ static void ide_set_sector(IDEState *s, int64_t sector_num)
     }
 }
 
+#if defined(DEBUG_IDE_EXTENDED)
+static void dump_sector_bytes(const char *tag, int64_t sector_num,
+                              const uint8_t *buf, int n)
+{
+    int i, j;
+    for (i = 0; i < n; i++) {
+        printf("%s sector=%" PRId64 " bytes:", tag, sector_num + i);
+        for (j = 0; j < 512; j++)
+            printf(" %02x", buf[i * 512 + j]);
+        printf("\n");
+    }
+}
+#endif
+
 static void ide_sector_read(IDEState *s)
 {
     int64_t sector_num;
@@ -594,7 +609,7 @@ static void ide_sector_read(IDEState *s)
     printf("read sector=%" PRId64 " count=%d\n", sector_num, n);
 #endif
     s->io_nb_sectors = n;
-    ret = s->bs->read_async(s->bs, sector_num, s->io_buffer, n, 
+    ret = s->bs->read_async(s->bs, sector_num, s->io_buffer, n,
                             ide_sector_read_cb, s);
     if (ret < 0) {
         /* error */
@@ -602,6 +617,9 @@ static void ide_sector_read(IDEState *s)
         ide_set_irq(s);
     } else if (ret == 0) {
         /* synchronous case (needed for performance) */
+#if defined(DEBUG_IDE_EXTENDED)
+        dump_sector_bytes("read", sector_num, s->io_buffer, n);
+#endif
         ide_sector_read_cb(s, 0);
     } else {
         /* async case */
@@ -647,6 +665,9 @@ static void ide_sector_write_cb1(IDEState *s)
 #if defined(DEBUG_IDE)
     printf("write sector=%" PRId64 "  count=%d\n",
            sector_num, s->io_nb_sectors);
+#endif
+#if defined(DEBUG_IDE_EXTENDED)
+    dump_sector_bytes("write", sector_num, s->io_buffer, s->io_nb_sectors);
 #endif
     ret = s->bs->write_async(s->bs, sector_num, s->io_buffer, s->io_nb_sectors, 
                              ide_sector_write_cb2, s);
@@ -718,6 +739,11 @@ static void ide_exec_cmd(IDEState *s, int val)
         break;
     case WIN_SPECIFY:
     case WIN_RECAL:
+    case WIN_FLUSH_CACHE:
+    case WIN_FLUSH_CACHE_EXT:
+    case WIN_VERIFY:
+    case WIN_VERIFY_ONCE:
+    case WIN_VERIFY_EXT:
         s->error = 0;
         s->status = READY_STAT | SEEK_STAT;
         ide_set_irq(s);
@@ -2391,7 +2417,7 @@ void ide_fill_cmos(IDEIFState *s, void *cmos,
 {
     // hard disk type, fixes "MS-DOS compatibility mode" in win9x
     uint8_t d_0x12 = 0;
-    if (s->drives[0]) {
+    if (s->drives[0] && s->drives[0]->drive_kind == IDE_HD) {
         d_0x12 |= 0xf0;
         set(cmos, 0x19, 47);
         set(cmos, 0x1b, set(cmos, 0x21, s->drives[0]->cylinders));
@@ -2402,7 +2428,7 @@ void ide_fill_cmos(IDEIFState *s, void *cmos,
         set(cmos, 0x20, 0xc0 | ((s->drives[0]->heads > 8) << 3));
         set(cmos, 0x23, s->drives[0]->sectors);
     }
-    if (s->drives[1]) {
+    if (s->drives[1] && s->drives[1]->drive_kind == IDE_HD) {
         d_0x12 |= 0x0f;
         set(cmos, 0x1a, 47);
         set(cmos, 0x24, set(cmos, 0x2a, s->drives[1]->cylinders));

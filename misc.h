@@ -17,6 +17,7 @@ uint8_t cmos_ioport_read(CMOS *cmos, int addr);
 void cmos_ioport_write(CMOS *cmos, int addr, uint8_t val);
 
 uint8_t cmos_set(void *cmos, int addr, uint8_t val);
+void cmos_update_checksum(void *cmos);
 
 typedef struct EMULINK EMULINK;
 EMULINK *emulink_init();

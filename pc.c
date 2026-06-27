@@ -768,6 +768,7 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
 
 	if (conf->fill_cmos)
 		ide_fill_cmos(pc->ide, pc->cmos, cmos_set);
+	cmos_update_checksum(pc->cmos);
 
 	int piix3_devfn;
 	pc->i440fx = i440fx_init(&pc->pcibus, &piix3_devfn);
