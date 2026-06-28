@@ -54,6 +54,7 @@ typedef struct {
 	long phys_mem_size;
 	char *vga_mem;
 	int vga_mem_size;
+	int vga_card_is_cirrus;
 	int64_t boot_start_time;
 
 	SimpleFBDrawFunc *redraw;
@@ -82,7 +83,7 @@ typedef struct {
 
 	u8 port92;
 	int shutdown_state;
-	int reset_request;
+	u8 cf9; /* PIIX reset control register (port 0xCF9) */
 
 	// non-owning strings
 	const char *linuxstart;
@@ -113,6 +114,7 @@ typedef struct {
 	int fpu;
 	int enable_serial;
 	int vga_force_8dm;
+	int vga_card; /* VGA_CARD_BOCHS (default) or VGA_CARD_CIRRUS, see vga.h */
 } PCConfig;
 
 PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,

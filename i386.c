@@ -5,6 +5,8 @@
 #include <unistd.h>
 #include <string.h>
 
+//#define DEBUG_INT10
+
 #ifdef BUILD_ESP32
 #include "esp_attr.h"
 #define noinline __attribute__((noinline))
@@ -4564,6 +4566,14 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 {
 	if (!(cpu->cr0 & 1)) {
 		/* REAL-ADDRESS-MODE */
+#ifdef DEBUG_INT10
+		if (no == 0x10) {
+			printf("int10: ax=%04x bx=%04x cx=%04x dx=%04x es=%04x di=%04x cs:ip=%04x:%04x\n",
+			       lreg16(0), lreg16(3), lreg16(1), lreg16(2),
+			       cpu->seg[SEG_ES].sel, lreg16(7),
+			       cpu->seg[SEG_CS].sel, cpu->ip);
+		}
+#endif
 		uword sp_mask = cpu->seg[SEG_SS].flags & SEG_B_BIT ? 0xffffffff : 0xffff;
 		OptAddr meml;
 		uword base = cpu->idt.base;

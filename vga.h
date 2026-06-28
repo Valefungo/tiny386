@@ -13,6 +13,17 @@ VGAState *vga_init(char *vga_ram, int vga_ram_size,
                    uint8_t *fb, int width, int height);
 void vga_set_force_8dm(VGAState *s, int v);
 
+enum {
+    VGA_CARD_BOCHS = 0,
+    VGA_CARD_CIRRUS,
+};
+void vga_set_card_type(VGAState *s, int card_type);
+
+uint8_t cirrus_blt_mmio_read8(VGAState *s, uint32_t off);
+void cirrus_blt_mmio_write8(VGAState *s, uint32_t off, uint8_t val);
+int vga_cirrus_mmio_active(VGAState *s);
+int vga_cirrus_mmio_use_pciaddr(VGAState *s);
+
 int vga_step(VGAState *vga);
 void vga_refresh(VGAState *s,
                  SimpleFBDrawFunc *redraw_func, void *opaque, int full_update);

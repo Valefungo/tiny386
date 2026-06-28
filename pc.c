@@ -207,6 +207,8 @@ static u8 pc_io_read(void *o, int addr)
 	case 0xcfc: case 0xcfd: case 0xcfe: case 0xcff:
 		val = i440fx_read_data(pc->i440fx, addr - 0xcfc, 0);
 		return val;
+	case 0xcf9:
+		return pc->cf9;
 	case 0x300: case 0x301: case 0x302: case 0x303:
 	case 0x304: case 0x305: case 0x306: case 0x307:
 	case 0x308: case 0x309: case 0x30a: case 0x30b:
@@ -425,6 +427,16 @@ static void pc_io_write(void *o, int addr, u8 val)
 	case 0xcfc: case 0xcfd: case 0xcfe: case 0xcff:
 		i440fx_write_data(pc->i440fx, addr - 0xcfc, val, 0);
 		return;
+	case 0xcf9:
+		/* PIIX Reset Control Register. Bit 2 (SYS_RST) requests an
+		 * actual full reset (used by guest BIOS/OS as a last-resort
+		 * hard reboot, e.g. SeaBIOS's pci_reboot()); bit 1 alone
+		 * only arms it. Apply synchronously, same reasoning as
+		 * pc_reset_request() above. */
+		pc->cf9 = val;
+		if (val & 0x04)
+			load_bios_and_reset(pc);
+		return;
 	case 0x300: case 0x301: case 0x302: case 0x303:
 	case 0x304: case 0x305: case 0x306: case 0x307:
 	case 0x308: case 0x309: case 0x30a: case 0x30b:
@@ -575,10 +587,6 @@ void pc_vga_step(void *o)
 
 void pc_step(PC *pc)
 {
-	if (pc->reset_request) {
-		pc->reset_request = 0;
-		load_bios_and_reset(pc);
-	}
 
 	i8254_update_irq(pc->pit);
 	cmos_update_irq(pc->cmos);
@@ -619,12 +627,49 @@ static void set_pci_vga_bar(void *opaque, int bar_num, uint32_t addr, bool enabl
 				 NULL);
 }
 
+/* Cirrus GD5430 BitBlt MMIO registers. Real hardware (86Box
+ * gd543x_recalc_mapping()/gd54xx_*_linear()) exposes them in one of two
+ * places depending on SR0x17 bit6 (CIRRUS_MMIO_USE_PCIADDR), only when
+ * bit2 (CIRRUS_MMIO_ENABLE) is set: the last 256 bytes of the LFB
+ * aperture (bit6 set), or the fixed absolute physical address 0xb8000
+ * outside the LFB entirely (bit6 clear) - never a fixed BAR-relative
+ * 0xb8000 offset, which matches neither real mode. */
+#define CIRRUS_MMIO_ABS_BASE 0xb8000
+#define CIRRUS_MMIO_ABS_END  0xb8100
+
+static inline bool cirrus_mmio_lfb_hit(PC *pc, uword bar_rel_addr, uint32_t *off)
+{
+	if (!pc->vga_card_is_cirrus || !vga_cirrus_mmio_active(pc->vga) ||
+	    !vga_cirrus_mmio_use_pciaddr(pc->vga))
+		return false;
+	if (bar_rel_addr < (uword)(pc->vga_mem_size - 256) || bar_rel_addr >= pc->vga_mem_size)
+		return false;
+	*off = bar_rel_addr & 0xff;
+	return true;
+}
+
+static inline bool cirrus_mmio_abs_hit(PC *pc, uword raw_addr, uint32_t *off)
+{
+	if (!pc->vga_card_is_cirrus || !vga_cirrus_mmio_active(pc->vga) ||
+	    vga_cirrus_mmio_use_pciaddr(pc->vga))
+		return false;
+	if (raw_addr < CIRRUS_MMIO_ABS_BASE || raw_addr >= CIRRUS_MMIO_ABS_END)
+		return false;
+	*off = raw_addr - CIRRUS_MMIO_ABS_BASE;
+	return true;
+}
+
 static u8 iomem_read8(void *iomem, uword addr)
 {
 	PC *pc = iomem;
+	uint32_t off;
+	if (cirrus_mmio_abs_hit(pc, addr, &off))
+		return cirrus_blt_mmio_read8(pc->vga, off);
 	uword vga_addr2 = pc->pci_vga_ram_addr;
 	if (addr >= vga_addr2) {
 		addr -= vga_addr2;
+		if (cirrus_mmio_lfb_hit(pc, addr, &off))
+			return cirrus_blt_mmio_read8(pc->vga, off);
 		if (addr < pc->vga_mem_size)
 			return pc->vga_mem[addr];
 		else
@@ -636,9 +681,18 @@ static u8 iomem_read8(void *iomem, uword addr)
 static void iomem_write8(void *iomem, uword addr, u8 val)
 {
 	PC *pc = iomem;
+	uint32_t off;
+	if (cirrus_mmio_abs_hit(pc, addr, &off)) {
+		cirrus_blt_mmio_write8(pc->vga, off, val);
+		return;
+	}
 	uword vga_addr2 = pc->pci_vga_ram_addr;
 	if (addr >= vga_addr2) {
 		addr -= vga_addr2;
+		if (cirrus_mmio_lfb_hit(pc, addr, &off)) {
+			cirrus_blt_mmio_write8(pc->vga, off, val);
+			return;
+		}
 		if (addr < pc->vga_mem_size)
 			pc->vga_mem[addr] = val;
 		return;
@@ -655,10 +709,21 @@ static u16 iomem_read16(void *iomem, uword addr)
 static void iomem_write16(void *iomem, uword addr, u16 val)
 {
 	PC *pc = iomem;
+	uint32_t off;
+	if (cirrus_mmio_abs_hit(pc, addr, &off)) {
+		cirrus_blt_mmio_write8(pc->vga, off, val & 0xff);
+		cirrus_blt_mmio_write8(pc->vga, off + 1, val >> 8);
+		return;
+	}
 	// fast path for vga ram
 	uword vga_addr2 = pc->pci_vga_ram_addr;
 	if (addr >= vga_addr2) {
 		addr -= vga_addr2;
+		if (cirrus_mmio_lfb_hit(pc, addr, &off)) {
+			cirrus_blt_mmio_write8(pc->vga, off, val & 0xff);
+			cirrus_blt_mmio_write8(pc->vga, off + 1, val >> 8);
+			return;
+		}
 		if (addr + 1 < pc->vga_mem_size)
 			*(uint16_t *)&(pc->vga_mem[addr]) = val;
 		return;
@@ -675,11 +740,26 @@ static u32 iomem_read32(void *iomem, uword addr)
 static void iomem_write32(void *iomem, uword addr, u32 val)
 {
 	PC *pc = iomem;
+	uint32_t off;
+	if (cirrus_mmio_abs_hit(pc, addr, &off)) {
+		cirrus_blt_mmio_write8(pc->vga, off, val & 0xff);
+		cirrus_blt_mmio_write8(pc->vga, off + 1, (val >> 8) & 0xff);
+		cirrus_blt_mmio_write8(pc->vga, off + 2, (val >> 16) & 0xff);
+		cirrus_blt_mmio_write8(pc->vga, off + 3, (val >> 24) & 0xff);
+		return;
+	}
 	// fast path for vga ram
 	uword vga_addr2 = pc->pci_vga_ram_addr;
 	if (addr >= vga_addr2) {
 		uword vga_addr2 = pc->pci_vga_ram_addr;
 		addr -= vga_addr2;
+		if (cirrus_mmio_lfb_hit(pc, addr, &off)) {
+			cirrus_blt_mmio_write8(pc->vga, off, val & 0xff);
+			cirrus_blt_mmio_write8(pc->vga, off + 1, (val >> 8) & 0xff);
+			cirrus_blt_mmio_write8(pc->vga, off + 2, (val >> 16) & 0xff);
+			cirrus_blt_mmio_write8(pc->vga, off + 3, (val >> 24) & 0xff);
+			return;
+		}
 		if (addr + 3 < pc->vga_mem_size)
 			*(uint32_t *)&(pc->vga_mem[addr]) = val;
 		return;
@@ -690,11 +770,24 @@ static void iomem_write32(void *iomem, uword addr, u32 val)
 static bool iomem_write_string(void *iomem, uword addr, uint8_t *buf, int len)
 {
 	PC *pc = iomem;
+	uint32_t off;
+	if (cirrus_mmio_abs_hit(pc, addr, &off)) {
+		int i;
+		for (i = 0; i < len; i++)
+			cirrus_blt_mmio_write8(pc->vga, off + i, buf[i]);
+		return true;
+	}
 	// fast path for vga ram
 	uword vga_addr2 = pc->pci_vga_ram_addr;
 	if (addr >= vga_addr2) {
 		uword vga_addr2 = pc->pci_vga_ram_addr;
 		addr -= vga_addr2;
+		if (cirrus_mmio_lfb_hit(pc, addr, &off)) {
+			int i;
+			for (i = 0; i < len; i++)
+				cirrus_blt_mmio_write8(pc->vga, off + i, buf[i]);
+			return true;
+		}
 		if (addr + len < pc->vga_mem_size) {
 			memcpy(pc->vga_mem + addr, buf, len);
 			return true;
@@ -707,7 +800,28 @@ static bool iomem_write_string(void *iomem, uword addr, uint8_t *buf, int len)
 static void pc_reset_request(void *p)
 {
 	PC *pc = p;
-	pc->reset_request = 1;
+	/* Called synchronously from deep inside the interpreter (the OUT
+	 * instruction that pulses the KBC reset line, port 0x64 cmd 0xFE).
+	 * Apply it immediately rather than deferring to the next pc_step():
+	 * cpu_exec1() re-reads cpu->next_ip/segment state from scratch on
+	 * every instruction, so resetting now safely redirects execution
+	 * starting at the very next instruction - exactly like a real
+	 * synchronous CPU reset. Deferring instead lets the guest's own
+	 * code keep running past the point it expected an immediate reset
+	 * (e.g. SeaBIOS's reboot fallback chain, which assumes the reset
+	 * already happened and moves on to increasingly drastic methods,
+	 * eventually a deliberate triple fault tiny386 can't recover from).
+	 *
+	 * This is a full reset (BIOS ROMs reshadowed), same as the 0xCF9
+	 * path below, not a lighter CPU-only reset: SeaBIOS tells a cold
+	 * boot from a quick "resume" via a flag (HaveRunPost) it manages
+	 * itself, and on a real i440FX/PIIX + SeaBIOS platform (what tiny386
+	 * models) a KBC-pulse reset is indistinguishable from any other
+	 * platform reset - both lead back to a full POST, with whatever
+	 * needs to survive across it (e.g. NTDETECT's own retry state)
+	 * already living in ordinary RAM outside the BIOS shadow area,
+	 * which load_bios_and_reset() never touches. */
+	load_bios_and_reset(pc);
 }
 
 PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
@@ -795,6 +909,8 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
 	pc->vga = vga_init(pc->vga_mem, pc->vga_mem_size,
 			   fb, conf->width, conf->height);
 	vga_set_force_8dm(pc->vga, conf->vga_force_8dm);
+	vga_set_card_type(pc->vga, conf->vga_card);
+	pc->vga_card_is_cirrus = (conf->vga_card == VGA_CARD_CIRRUS);
 	pc->pci_vga = vga_pci_init(pc->vga, pc->pcibus, pc, set_pci_vga_bar);
 	pc->pci_vga_ram_addr = -1;
 
@@ -835,7 +951,7 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
 	pc->pcspk = pcspk_init(pc->pit);
 	pc->port92 = 0x2;
 	pc->shutdown_state = 0;
-	pc->reset_request = 0;
+	pc->cf9 = 0;
 	return pc;
 }
 
@@ -976,6 +1092,11 @@ int parse_conf_ini(void* user, const char* section,
 			conf->width = atoi(value);
 		} else if (NAME("height")) {
 			conf->height = atoi(value);
+		} else if (NAME("card")) {
+			if (strcmp(value, "cirrus") == 0)
+				conf->vga_card = VGA_CARD_CIRRUS;
+			else
+				conf->vga_card = VGA_CARD_BOCHS;
 		}
 	} else if (SEC("cpu")) {
 		if (NAME("gen")) {

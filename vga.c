@@ -44,6 +44,7 @@ void *pcmalloc(long size);
 
 //#define DEBUG_VBE
 //#define DEBUG_VGA_REG
+#define DEBUG_CIRRUS
 
 #define MSR_COLOR_EMULATION 0x01
 #define MSR_PAGE_SELECT     0x20
@@ -147,6 +148,56 @@ struct VGAState {
     uint16_t vbe_regs[VBE_DISPI_INDEX_NB];
     uint32_t vbe_start_addr;
     uint32_t vbe_line_offset;
+
+    /* Cirrus GD5430 extension */
+    int card_type; /* VGA_CARD_BOCHS (default) or VGA_CARD_CIRRUS */
+    /* On real GD5430 silicon (chip ID >= CIRRUS_ID_CLGD5429), the
+     * extended-register lock is hardwired open from reset and SR06
+     * writes never change it - only chips OLDER than 5429 derive the
+     * lock from the SR06==0x12 key (86Box vid_cl54xx.c:769-770,
+     * 4211-4214). It still must be readable/round-trippable for
+     * detection code, see sr06_shadow below. */
+    int cirrus_unlocked;
+    /* GR0x09/0x0A/0x0B: legacy bank-select/extended-write-mode scratch
+     * registers. Not part of the BLT engine and bank-switching itself
+     * isn't implemented, but they must read back whatever was last
+     * written (regardless of lock state, like on real hardware) -
+     * guest hardware-detection code probes them for consistency before
+     * trusting the rest of the Cirrus register set. */
+    uint8_t cirrus_bank_reg[3];
+    /* GR0x0C/0x0D: overlay color-key compare value/mask. GR0x0E: DPMS
+     * control (5429+). Video overlay compositing and DPMS power
+     * signaling aren't implemented (no second video plane / no host
+     * power-state concept to drive) - stored only so reads round-trip
+     * what was written, like the VCLK/bus-config SR registers above. */
+    uint8_t cirrus_gr_ext[3];
+    /* Extended Sequencer registers 0x08-0xFF: raw round-trip storage
+     * for everything we don't otherwise special-case (VCLK dividers,
+     * DRAM control, bus-type/MMIO config, I2C/DDC, misc control) -
+     * these don't affect tiny386's fixed-function rendering, but must
+     * read back what was written for hardware detection. */
+    uint8_t cirrus_sr_ext[256];
+    struct {
+        int ena;
+        int large; /* cur_xsize/cur_ysize: 64 if set, 32 if clear */
+        int x, y;
+        uint32_t addr;
+    } cirrus_cursor;
+    uint8_t cirrus_ext_palette[16 * 3]; /* extended palette, 16 RGB entries (6-bit) */
+    uint8_t cirrus_dac_state; /* hidden DAC register read state machine (0x3c6) */
+    uint8_t cirrus_dac_hidden; /* hidden DAC control register value */
+    struct cirrus_blt_s {
+        uint32_t bg_col, fg_col;
+        uint16_t width, height, dst_pitch, src_pitch;
+        uint32_t dst_addr, src_addr;
+        uint8_t mask, mode, rop, modeext;
+        uint16_t trans_col, trans_mask;
+        uint8_t status; /* bit0 BUSY, bit1 START, bit2 RESET, bit7 AUTOSTART */
+        /* run-time state, valid only while a blit is executing */
+        int dir;
+        int pixel_width;
+        int pattern_x;
+    } cirrus_blt;
 
 #if defined(SCALE_3_2) || defined(SCALE_2_1) || defined(SWAPXY)
 #ifndef LCD_WIDTH
@@ -738,10 +789,14 @@ static void vga_text_refresh(VGAState *s,
     font_base[1] = vga_ram + (((v >> 5) & 1) | ((v >> 1) & 6)) * 8192 * 4 + 2;
     
     line_offset = s->cr[0x13];
+    if (s->card_type == VGA_CARD_CIRRUS)
+        line_offset |= (s->cr[0x1b] & 0x10) << 4;
     line_offset <<= 3;
 
     start_addr = s->cr[0x0d] | (s->cr[0x0c] << 8);
-    
+    if (s->card_type == VGA_CARD_CIRRUS)
+        start_addr |= ((s->cr[0x1b] & 0x01) << 16) | ((s->cr[0x1b] & 0x0c) << 15);
+
     cheight = (s->cr[9] & 0x1f) + 1;
     cwidth = 8;
     if (!s->force_8dm && !(s->sr[1] & 0x01))
@@ -962,6 +1017,71 @@ static void vga_text_refresh(VGAState *s,
     redraw_func(opaque, 0, 0, fb_dev->width, fb_dev->height);
 }
 
+/* Cirrus hardware cursor overlay, drawn as a final pass over the
+ * already-rendered frame (86Box vid_cl54xx.c:2075-2137,
+ * gd54xx_hwcursor_draw). 2bpp-per-pixel format: byte 0 of each 8-pixel
+ * group is the AND mask, byte 1 the XOR mask (offset +8 within the row
+ * for the 64x64 size, +0x80 - the fixed 32x32 slot size - for 32x32),
+ * comb = (XOR<<0)|(AND<<1) selects: 0=passthrough, 1=bg color,
+ * 2=XOR-invert, 3=fg color. Colors come from the extended palette
+ * entries 0 and 0xf (gd54xx->extpallook[0]/[0xf]). */
+static void cirrus_cursor_draw(VGAState *s, FBDevice *fb_dev, int i0)
+{
+    if (!s->cirrus_cursor.ena)
+        return;
+    int size = s->cirrus_cursor.large ? 64 : 32;
+    int pitch = s->cirrus_cursor.large ? 16 : 4;
+    int xor_off = s->cirrus_cursor.large ? 8 : 0x80;
+#if BPP == 32
+    uint32_t bgcol = rgb_to_pixel(c6_to_8(s->cirrus_ext_palette[0]),
+                                  c6_to_8(s->cirrus_ext_palette[1]),
+                                  c6_to_8(s->cirrus_ext_palette[2]));
+    uint32_t fgcol = rgb_to_pixel(c6_to_8(s->cirrus_ext_palette[0xf * 3]),
+                                  c6_to_8(s->cirrus_ext_palette[0xf * 3 + 1]),
+                                  c6_to_8(s->cirrus_ext_palette[0xf * 3 + 2]));
+#else
+    uint32_t bgcol = (s->cirrus_ext_palette[2] >> 1) |
+        (s->cirrus_ext_palette[1] << 5) | ((s->cirrus_ext_palette[0] >> 1) << 11);
+    uint32_t fgcol = (s->cirrus_ext_palette[0xf * 3 + 2] >> 1) |
+        (s->cirrus_ext_palette[0xf * 3 + 1] << 5) |
+        ((s->cirrus_ext_palette[0xf * 3] >> 1) << 11);
+#endif
+    for (int row = 0; row < size; row++) {
+        int yy = s->cirrus_cursor.y + row;
+        if (yy < 0 || yy >= fb_dev->height)
+            continue;
+        uint32_t row_addr = s->cirrus_cursor.addr + row * pitch;
+        for (int xb = 0; xb < size; xb += 8) {
+            uint32_t a0 = row_addr + (xb >> 3);
+            uint32_t a1 = row_addr + xor_off + (xb >> 3);
+            uint8_t dat0 = (a0 < (uint32_t)s->vga_ram_size) ? s->vga_ram[a0] : 0;
+            uint8_t dat1 = (a1 < (uint32_t)s->vga_ram_size) ? s->vga_ram[a1] : 0;
+            for (int xx = 0; xx < 8; xx++) {
+                int b0 = (dat0 >> (7 - xx)) & 1;
+                int b1 = (dat1 >> (7 - xx)) & 1;
+                int comb = b1 | (b0 << 1);
+                int xpos = s->cirrus_cursor.x + xb + xx;
+                if (comb == 0 || xpos < 0 || xpos >= fb_dev->width)
+                    continue;
+                int idx = (BPP / 8) * (yy * fb_dev->width + xpos) + i0;
+                uint32_t color;
+                switch (comb) {
+                case 1: color = bgcol; break;
+                case 3: color = fgcol; break;
+                default: /* 2: XOR-invert the existing pixel */
+                    color = 0;
+                    for (int k = 0; k < BPP / 8; k++)
+                        color |= (uint32_t)fb_dev->fb_data[idx + k] << (8 * k);
+                    color ^= (BPP == 32) ? 0xffffffu : 0xffffu;
+                    break;
+                }
+                for (int k = 0; k < BPP / 8; k++)
+                    fb_dev->fb_data[idx + k] = color >> (8 * k);
+            }
+        }
+    }
+}
+
 static void vga_graphic_refresh(VGAState *s,
                                 SimpleFBDrawFunc *redraw_func, void *opaque,
                                 int full_update)
@@ -974,6 +1094,17 @@ static void vga_graphic_refresh(VGAState *s,
     h++;
 
     int shift_control = (s->gr[0x05] >> 5) & 3;
+#ifdef DEBUG_CIRRUS
+    {
+        static int last_w = -1, last_h = -1, last_sc = -1, last_vbe = -1;
+        if (w != last_w || h != last_h || shift_control != last_sc || vbe_enabled(s) != last_vbe) {
+            printf("cirrus: graphic_refresh w=%d h=%d shift_control=%d vbe=%d fbw=%d fbh=%d sr1=0x%02x gr5=0x%02x cr1=0x%02x\n",
+                   w, h, shift_control, vbe_enabled(s), s->fb_dev->width, s->fb_dev->height,
+                   s->sr[1], s->gr[5], s->cr[1]);
+            last_w = w; last_h = h; last_sc = shift_control; last_vbe = vbe_enabled(s);
+        }
+    }
+#endif
     int double_scan = (s->cr[0x09] >> 7);
     int multi_scan, multi_run;
     if (!double_scan) {
@@ -986,7 +1117,11 @@ static void vga_graphic_refresh(VGAState *s,
     multi_run = multi_scan;
 
     uint32_t start_addr = s->cr[0x0d] | (s->cr[0x0c] << 8);
+    if (s->card_type == VGA_CARD_CIRRUS)
+        start_addr |= ((s->cr[0x1b] & 0x01) << 16) | ((s->cr[0x1b] & 0x0c) << 15);
     uint32_t line_offset = s->cr[0x13];
+    if (s->card_type == VGA_CARD_CIRRUS)
+        line_offset |= (s->cr[0x1b] & 0x10) << 4;
     line_offset <<= 3;
 //    uint32_t line_compare = s->cr[0x18] |
 //        ((s->cr[0x07] & 0x10) << 4) |
@@ -997,6 +1132,15 @@ static void vga_graphic_refresh(VGAState *s,
 //        line_compare = 65535;
     }
     uint32_t addr1 = 4 * start_addr;
+    /* CR0x1B bit1: select the display-memory wrap mask (86Box
+     * vid_cl54xx.c:2056). Only bounds the start of each scanline, not
+     * every per-pixel fetch within it - in practice this never differs
+     * from "no mask" for any vga_mem_size we actually configure (a few
+     * MB), so the approximation is harmless. */
+    if (s->card_type == VGA_CARD_CIRRUS) {
+        uint32_t vram_mask = (s->cr[0x1b] & 0x02) ? (uint32_t)(s->vga_ram_size - 1) : 0x3ffff;
+        addr1 &= vram_mask;
+    }
     uint8_t *vram = s->vga_ram;
     uint32_t palette[256];
     int xdiv = 1;
@@ -1009,7 +1153,42 @@ static void vga_graphic_refresh(VGAState *s,
                 w *= 2;
         }
     } else {
-        if (!vbe_enabled(s)) {
+        if (!vbe_enabled(s) && s->card_type == VGA_CARD_CIRRUS) {
+            /* Native Cirrus SVGA color depth: derived from the hidden DAC
+             * control register (0x3c6) + SR0x07 bpp bits, not from the
+             * Bochs VBE registers (86Box vid_cl54xx.c:1898-2040). SR0x07
+             * bit0 (CIRRUS_SR7_BPP_SVGA) also selects full vs halved dot
+             * clock (xdiv). */
+            int true_svga = s->sr[7] & 0x01;
+            uint8_t ctrl = s->cirrus_dac_hidden;
+            bpp = 8;
+            if (ctrl & 0x80) {
+                if (ctrl & 0x40) {
+                    switch (ctrl & 0x0f) {
+                    case 0: bpp = 15; break;
+                    case 1: bpp = 16; break;
+                    case 5: bpp = 24; break;
+                    case 8: case 9: bpp = 8; break;
+                    case 0xf:
+                        switch (s->sr[7] & 0x0e) {
+                        case 0x08: bpp = 32; break;
+                        case 0x04: bpp = 24; break;
+                        case 0x06: case 0x02: bpp = 16; break;
+                        default: bpp = 8; break;
+                        }
+                        break;
+                    default: break;
+                    }
+                } else {
+                    bpp = 15;
+                }
+            }
+            xdiv = true_svga ? 1 : 2;
+            if (bpp == 32)
+                line_offset *= 2;
+            if (bpp == 8)
+                update_palette256(s, palette);
+        } else if (!vbe_enabled(s)) {
             update_palette256(s, palette);
             xdiv = 2;
             bpp = 8;
@@ -1262,6 +1441,10 @@ static void vga_graphic_refresh(VGAState *s,
 #undef KLINE
 #endif
     }
+#if !defined(SCALE_3_2) && !defined(SCALE_2_1) && !defined(SWAPXY)
+    if (s->card_type == VGA_CARD_CIRRUS)
+        cirrus_cursor_draw(s, fb_dev, i0);
+#endif
     redraw_func(opaque, 0, 0, fb_dev->width, fb_dev->height);
 }
 
@@ -1355,6 +1538,610 @@ static const uint8_t gr_mask[16] = {
     (uint8_t)~0xff, /* 0x0f */
 };
 
+/*
+ * Cirrus Logic GD5430 BitBlt 2D acceleration engine.
+ *
+ * Only active when s->card_type == VGA_CARD_CIRRUS. Registers are kept in
+ * s->cirrus_blt and are accessible both through the classic extended GR
+ * ports (0x3ce/0x3cf, index > 8) and through a fixed MMIO window at offset
+ * 0xb8000 of the linear framebuffer BAR (see cirrus_blt_mmio_read8/write8
+ * and pc.c). Both paths share the same canonical offset numbering (0x00-
+ * 0x21, plus 0x40 for the status/trigger register), taken from the real
+ * GD5430 MMIO register map.
+ *
+ * Implemented: screen-to-screen / solid-fill BitBlt (cirrus_normal_blit,
+ * with a memmove() fast path for the common SRCCOPY case) and 8x8 pattern
+ * fill incl. monochrome color-expand solid fill (cirrus_pattern_copy) -
+ * these cover the BitBlt operations GDI actually issues for window
+ * drag/scroll and background/brush fills. CPU<->VRAM streaming blits
+ * (MEMSYSSRC/MEMSYSDEST, used for font color-expand and readback) and
+ * the full ROP/transparency matrix are deliberately not implemented yet;
+ * such requests complete as a no-op rather than hang the driver.
+ */
+#define CIRRUS_BLTMODE_BACKWARDS       0x01
+#define CIRRUS_BLTMODE_MEMSYSDEST      0x02
+#define CIRRUS_BLTMODE_MEMSYSSRC       0x04
+#define CIRRUS_BLTMODE_TRANSPARENTCOMP 0x08
+#define CIRRUS_BLTMODE_PIXELWIDTHMASK  0x30
+#define CIRRUS_BLTMODE_PIXELWIDTH8     0x00
+#define CIRRUS_BLTMODE_PIXELWIDTH16    0x10
+#define CIRRUS_BLTMODE_PIXELWIDTH24    0x20
+#define CIRRUS_BLTMODE_PIXELWIDTH32    0x30
+#define CIRRUS_BLTMODE_PATTERNCOPY     0x40
+#define CIRRUS_BLTMODE_COLOREXPAND     0x80
+
+#define CIRRUS_BLT_BUSY      0x01
+#define CIRRUS_BLT_START     0x02
+#define CIRRUS_BLT_RESET     0x04
+#define CIRRUS_BLT_FIFOUSED  0x10
+#define CIRRUS_BLT_PAUSED    0x20
+#define CIRRUS_BLT_APERTURE2 0x40
+#define CIRRUS_BLT_AUTOSTART 0x80
+
+#define CIRRUS_BLTMODEEXT_DWORDGRANULARITY 0x01
+#define CIRRUS_BLTMODEEXT_COLOREXPINV      0x02
+#define CIRRUS_BLTMODEEXT_SOLIDFILL        0x04
+#define CIRRUS_BLTMODEEXT_BACKGROUNDONLY   0x08
+
+static uint8_t cirrus_rop(VGAState *s, uint8_t dst, uint8_t src)
+{
+    switch (s->cirrus_blt.rop) {
+    case 0x00: return 0x00;
+    case 0x05: return src & dst;
+    case 0x06: return dst;
+    case 0x09: return src & ~dst;
+    case 0x0b: return ~dst;
+    case 0x0d: return src;
+    case 0x0e: return 0xff;
+    case 0x50: return ~src & dst;
+    case 0x59: return src ^ dst;
+    case 0x6d: return src | dst;
+    case 0x90: return ~(src | dst);
+    case 0x95: return ~(src ^ dst);
+    case 0xad: return src | ~dst;
+    case 0xd0: return ~src;
+    case 0xd6: return ~src | dst;
+    case 0xda: return ~(src & dst);
+    default: return dst;
+    }
+}
+
+static int cirrus_get_pixel_width(VGAState *s)
+{
+    switch (s->cirrus_blt.mode & CIRRUS_BLTMODE_PIXELWIDTHMASK) {
+    case CIRRUS_BLTMODE_PIXELWIDTH16: return 2;
+    case CIRRUS_BLTMODE_PIXELWIDTH24: return 3;
+    case CIRRUS_BLTMODE_PIXELWIDTH32: return 4;
+    default: return 1;
+    }
+}
+
+static uint8_t cirrus_color_expand(VGAState *s, int mask, int shift)
+{
+    if (mask)
+        return s->cirrus_blt.fg_col >> (shift << 3);
+    else
+        return s->cirrus_blt.bg_col >> (shift << 3);
+}
+
+/* mirrors gd54xx_blit(): writes *dst = target unless skipped by the
+ * pattern's left clip (skip) or, for transparent/color-expand modes,
+ * by the pattern bit (mask). */
+static void cirrus_blt_write_pixel(VGAState *s, int mask, uint8_t *dst,
+                                   uint8_t target, int skip)
+{
+    int is_transp = s->cirrus_blt.mode & CIRRUS_BLTMODE_TRANSPARENTCOMP;
+    int is_bgonly = s->cirrus_blt.modeext & CIRRUS_BLTMODEEXT_BACKGROUNDONLY;
+
+    if (is_transp) {
+        if ((s->cirrus_blt.mode & CIRRUS_BLTMODE_COLOREXPAND) &&
+            (s->cirrus_blt.modeext & CIRRUS_BLTMODEEXT_COLOREXPINV))
+            mask = !mask;
+        if (mask && !skip)
+            *dst = target;
+    } else if ((s->cirrus_blt.mode & CIRRUS_BLTMODE_COLOREXPAND) && is_bgonly) {
+        if (mask || !skip)
+            *dst = target;
+    } else {
+        if (!skip)
+            *dst = target;
+    }
+}
+
+/* Screen-to-screen / solid BitBlt. Handles SRCCOPY and any ROP, plus
+ * monochrome color-expand reading the pattern from src VRAM. Transparent
+ * comparison and CPU<->VRAM streaming are out of scope for now (see
+ * cirrus_blt_start). */
+static void cirrus_normal_blit(VGAState *s)
+{
+    struct cirrus_blt_s *b = &s->cirrus_blt;
+    uint8_t *vram = (uint8_t *)s->vga_ram;
+    uint32_t vram_size = (uint32_t)s->vga_ram_size;
+    int row;
+
+    /* fast path: plain SRCCOPY screen-to-screen/fill, no color expand */
+    if (b->rop == 0x0d && !(b->mode & CIRRUS_BLTMODE_COLOREXPAND)) {
+        for (row = 0; row <= b->height; row++) {
+            int64_t doff = (int64_t)b->dst_addr + (int64_t)row * b->dst_pitch * b->dir;
+            int64_t soff = (int64_t)b->src_addr + (int64_t)row * b->src_pitch * b->dir;
+            uint32_t dbase = (uint32_t)(b->dir > 0 ? doff : doff - b->width);
+            uint32_t sbase = (uint32_t)(b->dir > 0 ? soff : soff - b->width);
+            uint32_t len = (uint32_t)b->width + 1;
+            if (dbase + len > vram_size || sbase + len > vram_size)
+                break;
+            memmove(vram + dbase, vram + sbase, len);
+        }
+        return;
+    }
+
+    for (row = 0; row <= b->height; row++) {
+        uint32_t dst_addr = (uint32_t)(b->dst_addr + (int64_t)row * b->dst_pitch * b->dir);
+        uint32_t src_addr = (uint32_t)(b->src_addr + (int64_t)row * b->src_pitch * b->dir);
+        int x_count = 0;
+        int col;
+        for (col = 0; col <= b->width; col++) {
+            uint8_t src, dst, target;
+            int mask;
+
+            if (dst_addr >= vram_size || src_addr >= vram_size)
+                break;
+
+            if (b->mode & CIRRUS_BLTMODE_COLOREXPAND) {
+                int shift = x_count % b->pixel_width;
+                mask = vram[src_addr] & (0x80 >> (x_count / b->pixel_width));
+                src = cirrus_color_expand(s, mask, shift);
+            } else {
+                src = vram[src_addr];
+                mask = 1;
+            }
+
+            dst = vram[dst_addr];
+            target = cirrus_rop(s, dst, src);
+
+            cirrus_blt_write_pixel(s, mask, &vram[dst_addr], target, 0);
+
+            dst_addr += b->dir;
+            if (!(b->mode & CIRRUS_BLTMODE_COLOREXPAND))
+                src_addr += b->dir;
+
+            x_count++;
+            if (x_count == (b->pixel_width << 3)) {
+                x_count = 0;
+                if (b->mode & CIRRUS_BLTMODE_COLOREXPAND)
+                    src_addr += b->dir;
+            }
+        }
+    }
+}
+
+/* 8x8 pattern fill, including monochrome color-expand patterns; with
+ * CIRRUS_BLTMODEEXT_SOLIDFILL this is how GDI does accelerated solid
+ * color fills (the pattern source is then ignored, fg_col is used
+ * directly). Mirrors gd54xx_pattern_fill(). */
+static void cirrus_pattern_copy(VGAState *s)
+{
+    struct cirrus_blt_s *b = &s->cirrus_blt;
+    uint8_t *vram = (uint8_t *)s->vga_ram;
+    uint32_t vram_size = (uint32_t)s->vga_ram_size;
+    int pattern_pitch = b->pixel_width << 3;
+    uint32_t dsta = b->dst_addr;
+    int pattern_y = b->src_addr & 0x07;
+    uint32_t srca = b->src_addr & ~0x07u;
+    int y;
+
+    if (b->pixel_width == 3)
+        pattern_pitch = 32;
+    if (b->mode & CIRRUS_BLTMODE_COLOREXPAND)
+        pattern_pitch = 1;
+
+    for (y = 0; y <= b->height; y++) {
+        uint32_t srca2 = srca + (uint32_t)(pattern_y * pattern_pitch);
+        int pixel = 0;
+        int x;
+        for (x = 0; x <= b->width; x += b->pixel_width) {
+            int bitmask = 1;
+            int xx;
+
+            if (b->mode & CIRRUS_BLTMODE_COLOREXPAND) {
+                if (b->modeext & CIRRUS_BLTMODEEXT_SOLIDFILL)
+                    bitmask = 1;
+                else if (srca2 < vram_size)
+                    bitmask = vram[srca2] & (0x80 >> pixel);
+                else
+                    bitmask = 0;
+            }
+            for (xx = 0; xx < b->pixel_width; xx++) {
+                uint32_t dstoff = dsta + x + xx;
+                uint8_t src, target;
+                int skip;
+
+                if (dstoff >= vram_size)
+                    continue;
+
+                if (b->mode & CIRRUS_BLTMODE_COLOREXPAND) {
+                    src = cirrus_color_expand(s, bitmask, xx);
+                } else {
+                    uint32_t srcoff = srca2 + (x % (b->pixel_width << 3)) + xx;
+                    if (srcoff >= vram_size)
+                        continue;
+                    src = vram[srcoff];
+                }
+
+                target = cirrus_rop(s, vram[dstoff], src);
+                skip = (b->pixel_width == 3) ? ((x + xx) < b->pattern_x)
+                                              : (x < b->pattern_x);
+                cirrus_blt_write_pixel(s, bitmask, &vram[dstoff], target, skip);
+            }
+            pixel = (pixel + 1) & 7;
+        }
+        pattern_y = (pattern_y + 1) & 7;
+        dsta += b->dst_pitch;
+    }
+}
+
+/* Dispatches a triggered blit. Always synchronous: by the time this
+ * returns, BUSY/START are already cleared. */
+static void cirrus_blt_start(VGAState *s)
+{
+    struct cirrus_blt_s *b = &s->cirrus_blt;
+
+    if ((b->mode & CIRRUS_BLTMODE_BACKWARDS) &&
+        !(b->mode & (CIRRUS_BLTMODE_PATTERNCOPY | CIRRUS_BLTMODE_COLOREXPAND)) &&
+        !(b->mode & CIRRUS_BLTMODE_TRANSPARENTCOMP))
+        b->dir = -1;
+    else
+        b->dir = 1;
+
+    b->pixel_width = cirrus_get_pixel_width(s);
+
+    if (b->mode & (CIRRUS_BLTMODE_PATTERNCOPY | CIRRUS_BLTMODE_COLOREXPAND)) {
+        if (b->pixel_width == 3)
+            b->pattern_x = b->mask & 0x1f;
+        else
+            b->pattern_x = (b->mask & 0x07) * b->pixel_width;
+    } else {
+        b->pattern_x = 0;
+    }
+
+    if (b->mode & (CIRRUS_BLTMODE_MEMSYSSRC | CIRRUS_BLTMODE_MEMSYSDEST)) {
+        /* CPU<->VRAM streaming blits aren't implemented; complete as a
+         * no-op so the driver doesn't wait forever on BUSY. */
+    } else if (b->mode & CIRRUS_BLTMODE_PATTERNCOPY) {
+        cirrus_pattern_copy(s);
+    } else {
+        cirrus_normal_blit(s);
+    }
+
+    b->status &= ~(CIRRUS_BLT_START | CIRRUS_BLT_BUSY);
+}
+
+static void cirrus_blt_trigger(VGAState *s, uint8_t val)
+{
+    uint8_t old = s->cirrus_blt.status;
+    s->cirrus_blt.status = val;
+#ifdef DEBUG_CIRRUS
+    printf("cirrus: trigger status=0x%02x mode=0x%02x rop=0x%02x modeext=0x%02x "
+           "w=%d h=%d dst=0x%x dpitch=%d src=0x%x spitch=%d\n",
+           val, s->cirrus_blt.mode, s->cirrus_blt.rop, s->cirrus_blt.modeext,
+           s->cirrus_blt.width, s->cirrus_blt.height,
+           s->cirrus_blt.dst_addr, s->cirrus_blt.dst_pitch,
+           s->cirrus_blt.src_addr, s->cirrus_blt.src_pitch);
+#endif
+    if (!(old & CIRRUS_BLT_RESET) && (val & CIRRUS_BLT_RESET)) {
+        s->cirrus_blt.status &= ~(CIRRUS_BLT_START | CIRRUS_BLT_BUSY | CIRRUS_BLT_RESET);
+    } else if (!(old & CIRRUS_BLT_START) && (val & CIRRUS_BLT_START)) {
+        s->cirrus_blt.status |= CIRRUS_BLT_BUSY;
+        cirrus_blt_start(s);
+    }
+}
+
+/* canonical register space: 0x00-0x21 plus 0x40 (status/trigger),
+ * matching the real GD5430 MMIO BitBlt register map. Both the classic
+ * extended-GR port path and the MMIO window go through these. */
+static void cirrus_blt_reg_write8(VGAState *s, uint32_t off, uint8_t val)
+{
+    struct cirrus_blt_s *b = &s->cirrus_blt;
+#ifdef DEBUG_CIRRUS
+    printf("cirrus: reg_write8 off=0x%02x val=0x%02x\n", off, val);
+#endif
+    switch (off) {
+    case 0x00: b->bg_col = (b->bg_col & 0xffffff00) | val; break;
+    case 0x01: b->bg_col = (b->bg_col & 0xffff00ff) | ((uint32_t)val << 8); break;
+    case 0x02: b->bg_col = (b->bg_col & 0xff00ffff) | ((uint32_t)val << 16); break;
+    case 0x03: b->bg_col = (b->bg_col & 0x00ffffff) | ((uint32_t)val << 24); break;
+    case 0x04: b->fg_col = (b->fg_col & 0xffffff00) | val; break;
+    case 0x05: b->fg_col = (b->fg_col & 0xffff00ff) | ((uint32_t)val << 8); break;
+    case 0x06: b->fg_col = (b->fg_col & 0xff00ffff) | ((uint32_t)val << 16); break;
+    case 0x07: b->fg_col = (b->fg_col & 0x00ffffff) | ((uint32_t)val << 24); break;
+    case 0x08: b->width = (b->width & 0xff00) | val; break;
+    case 0x09: b->width = ((b->width & 0x00ff) | ((uint16_t)val << 8)) & 0x1fff; break;
+    case 0x0a: b->height = (b->height & 0xff00) | val; break;
+    case 0x0b: b->height = ((b->height & 0x00ff) | ((uint16_t)val << 8)) & 0x07ff; break;
+    case 0x0c: b->dst_pitch = (b->dst_pitch & 0xff00) | val; break;
+    case 0x0d: b->dst_pitch = ((b->dst_pitch & 0x00ff) | ((uint16_t)val << 8)) & 0x1fff; break;
+    case 0x0e: b->src_pitch = (b->src_pitch & 0xff00) | val; break;
+    case 0x0f: b->src_pitch = ((b->src_pitch & 0x00ff) | ((uint16_t)val << 8)) & 0x1fff; break;
+    case 0x10: b->dst_addr = (b->dst_addr & 0xffff00) | val; break;
+    case 0x11: b->dst_addr = (b->dst_addr & 0xff00ff) | ((uint32_t)val << 8); break;
+    case 0x12: b->dst_addr = ((b->dst_addr & 0x00ffff) | ((uint32_t)val << 16)) & 0x3fffff; break;
+    case 0x14: b->src_addr = (b->src_addr & 0xffff00) | val; break;
+    case 0x15: b->src_addr = (b->src_addr & 0xff00ff) | ((uint32_t)val << 8); break;
+    case 0x16: b->src_addr = ((b->src_addr & 0x00ffff) | ((uint32_t)val << 16)) & 0x3fffff; break;
+    case 0x17: b->mask = val; break;
+    case 0x18: b->mode = val; break;
+    case 0x1a: b->rop = val; break;
+    case 0x1b: b->modeext = val; break;
+    case 0x1c: b->trans_col = (b->trans_col & 0xff00) | val; break;
+    case 0x1d: b->trans_col = (b->trans_col & 0x00ff) | ((uint16_t)val << 8); break;
+    case 0x20: b->trans_mask = (b->trans_mask & 0xff00) | val; break;
+    case 0x21: b->trans_mask = (b->trans_mask & 0x00ff) | ((uint16_t)val << 8); break;
+    case 0x40: cirrus_blt_trigger(s, val); break;
+    default: break;
+    }
+}
+
+static uint8_t cirrus_blt_reg_read8(VGAState *s, uint32_t off)
+{
+    struct cirrus_blt_s *b = &s->cirrus_blt;
+    switch (off) {
+    case 0x00: return b->bg_col & 0xff;
+    case 0x01: return (b->bg_col >> 8) & 0xff;
+    case 0x02: return (b->bg_col >> 16) & 0xff;
+    case 0x03: return (b->bg_col >> 24) & 0xff;
+    case 0x04: return b->fg_col & 0xff;
+    case 0x05: return (b->fg_col >> 8) & 0xff;
+    case 0x06: return (b->fg_col >> 16) & 0xff;
+    case 0x07: return (b->fg_col >> 24) & 0xff;
+    case 0x08: return b->width & 0xff;
+    case 0x09: return (b->width >> 8) & 0xff;
+    case 0x0a: return b->height & 0xff;
+    case 0x0b: return (b->height >> 8) & 0xff;
+    case 0x0c: return b->dst_pitch & 0xff;
+    case 0x0d: return (b->dst_pitch >> 8) & 0xff;
+    case 0x0e: return b->src_pitch & 0xff;
+    case 0x0f: return (b->src_pitch >> 8) & 0xff;
+    case 0x10: return b->dst_addr & 0xff;
+    case 0x11: return (b->dst_addr >> 8) & 0xff;
+    case 0x12: return (b->dst_addr >> 16) & 0xff;
+    case 0x14: return b->src_addr & 0xff;
+    case 0x15: return (b->src_addr >> 8) & 0xff;
+    case 0x16: return (b->src_addr >> 16) & 0xff;
+    case 0x17: return b->mask;
+    case 0x18: return b->mode;
+    case 0x1a: return b->rop;
+    case 0x1b: return b->modeext;
+    case 0x1c: return b->trans_col & 0xff;
+    case 0x1d: return (b->trans_col >> 8) & 0xff;
+    case 0x20: return b->trans_mask & 0xff;
+    case 0x21: return (b->trans_mask >> 8) & 0xff;
+    case 0x40: return b->status;
+    default: return 0xff;
+    }
+}
+
+uint8_t cirrus_blt_mmio_read8(VGAState *s, uint32_t off)
+{
+    return cirrus_blt_reg_read8(s, off);
+}
+
+void cirrus_blt_mmio_write8(VGAState *s, uint32_t off, uint8_t val)
+{
+    cirrus_blt_reg_write8(s, off, val);
+}
+
+/* SR0x17 bit2 (CIRRUS_MMIO_ENABLE, 86Box vid_cl54xx.c:109/1796): the BLT
+ * MMIO window only intercepts VRAM accesses once the driver explicitly
+ * turns it on. Before that, the same byte range is plain VRAM - without
+ * this gate, a guest memory self-test that happens to touch that range
+ * before enabling MMIO would have its writes silently swallowed by the
+ * BLT registers instead of landing in VRAM. */
+int vga_cirrus_mmio_active(VGAState *s)
+{
+    return s->card_type == VGA_CARD_CIRRUS && (s->cirrus_sr_ext[0x17] & 0x04);
+}
+
+/* SR0x17 bit6 (CIRRUS_MMIO_USE_PCIADDR, 86Box vid_cl54xx.c:110): selects
+ * which of the two real-hardware MMIO addressing schemes is active when
+ * vga_cirrus_mmio_active() is true - the last 256 bytes of the LFB
+ * aperture (set) vs. the fixed absolute physical address 0xb8000, outside
+ * the LFB entirely (clear). See gd543x_recalc_mapping()/gd54xx_*_linear()
+ * in 86Box for both. */
+int vga_cirrus_mmio_use_pciaddr(VGAState *s)
+{
+    return s->cirrus_sr_ext[0x17] & 0x40;
+}
+
+/* translation table for the classic extended-GR port path (0x3ce/0x3cf,
+ * index > 8) to the canonical MMIO offset space above. */
+static int cirrus_gr_to_mmio_off(int gr_index)
+{
+    switch (gr_index) {
+    case 0x10: return 0x01;
+    case 0x11: return 0x05;
+    case 0x12: return 0x02;
+    case 0x13: return 0x06;
+    case 0x14: return 0x03;
+    case 0x15: return 0x07;
+    case 0x20: return 0x08;
+    case 0x21: return 0x09;
+    case 0x22: return 0x0a;
+    case 0x23: return 0x0b;
+    case 0x24: return 0x0c;
+    case 0x25: return 0x0d;
+    case 0x26: return 0x0e;
+    case 0x27: return 0x0f;
+    case 0x28: return 0x10;
+    case 0x29: return 0x11;
+    case 0x2a: return 0x12;
+    case 0x2c: return 0x14;
+    case 0x2d: return 0x15;
+    case 0x2e: return 0x16;
+    case 0x2f: return 0x17;
+    case 0x30: return 0x18;
+    case 0x31: return 0x40;
+    case 0x32: return 0x1a;
+    case 0x33: return 0x1b;
+    case 0x34: return 0x1c;
+    case 0x35: return 0x1d;
+    case 0x38: return 0x20;
+    case 0x39: return 0x21;
+    default: return -1;
+    }
+}
+
+/* Extended Sequencer registers (index > 7). Formulas match 86Box
+ * vid_cl54xx.c:760-857 (gd54xx_out, case 0x3c5). Memory-size scratch
+ * pads (0x0a/0x15), VCLK dividers (0x0b-0x0e/0x1b-0x1e), DRAM control
+ * (0x0f), bus-type/MMIO config (0x17), misc control (0x18) and I2C/DDC
+ * (0x08) don't affect tiny386's fixed-function rendering - they are
+ * stored as plain round-trip state so hardware-detection code that
+ * reads them back doesn't see stale/wrong values. The hardware cursor
+ * (0x10/0x11 + 7 alias banks, 0x12, 0x13) is functional, see
+ * cirrus_cursor_draw(). */
+static void cirrus_sr_ext_write(VGAState *s, int index, uint8_t val)
+{
+    s->cirrus_sr_ext[index & 0xff] = val;
+    switch (index) {
+    case 0x10: case 0x30: case 0x50: case 0x70:
+    case 0x90: case 0xb0: case 0xd0: case 0xf0:
+        s->cirrus_cursor.x = ((int)val << 3) | (index >> 5);
+        break;
+    case 0x11: case 0x31: case 0x51: case 0x71:
+    case 0x91: case 0xb1: case 0xd1: case 0xf1:
+        s->cirrus_cursor.y = ((int)val << 3) | (index >> 5);
+        break;
+    case 0x12:
+        s->cirrus_cursor.ena = val & 0x01; /* CIRRUS_CURSOR_SHOW */
+        s->cirrus_cursor.large = val & 0x04; /* CIRRUS_CURSOR_LARGE */
+        if (s->cirrus_cursor.large)
+            s->cirrus_cursor.addr = (s->vga_ram_size - 0x4000) +
+                (s->cirrus_sr_ext[0x13] & 0x3c) * 256;
+        else
+            s->cirrus_cursor.addr = (s->vga_ram_size - 0x4000) +
+                (s->cirrus_sr_ext[0x13] & 0x3f) * 256;
+        break;
+    case 0x13:
+        if (s->cirrus_cursor.large)
+            s->cirrus_cursor.addr = (s->vga_ram_size - 0x4000) + (val & 0x3c) * 256;
+        else
+            s->cirrus_cursor.addr = (s->vga_ram_size - 0x4000) + (val & 0x3f) * 256;
+        break;
+    default:
+        break;
+    }
+}
+
+static uint8_t cirrus_sr_ext_read(VGAState *s, int index)
+{
+    /* Memory-size scratch pads and bus-type/DRAM-width fields report the
+     * actual configured VRAM size / bus type so guest detection code
+     * sees consistent values, matching the exact bit encodings 86Box
+     * uses for chip ID >= CIRRUS_ID_CLGD5430 (vid_cl54xx.c:1324-1422). */
+    int kb = s->vga_ram_size >> 10;
+    switch (index) {
+    case 0x08: { /* I2C/DDC GPIO read-back (different bit positions
+                  * than the write side - 86Box vid_cl54xx.c:1315-1323) */
+        uint8_t ret = s->cirrus_sr_ext[0x08] & 0x7b;
+        if (s->cirrus_sr_ext[0x08] & 0x01) ret |= 0x04; /* SCL */
+        if (s->cirrus_sr_ext[0x08] & 0x02) ret |= 0x80; /* SDA */
+        return ret;
+    }
+    case 0x0a: { /* Scratch Pad 1 (memory size, 5402/542x-style) */
+        uint8_t ret = s->cirrus_sr_ext[0x0a] & ~0x1a;
+        if (kb == 512) ret |= 0x08;
+        else if (kb == 1024) ret |= 0x10;
+        else if (kb == 2048) ret |= 0x18;
+        return ret;
+    }
+    case 0x0f: { /* DRAM control (bus width) */
+        uint8_t ret = s->cirrus_sr_ext[0x0f] & ~0x98;
+        if (kb == 512) ret |= 0x08;
+        else if (kb == 1024) ret |= 0x10;
+        else if (kb == 2048) ret |= 0x18;
+        else if (kb == 4096) ret |= 0x98;
+        return ret;
+    }
+    case 0x15: { /* Scratch Pad 3 (memory size, 543x-style) */
+        uint8_t ret = s->cirrus_sr_ext[0x15] & ~0x0f;
+        int mb = s->vga_ram_size >> 20;
+        if (mb == 1) ret |= 0x02;
+        else if (mb == 2) ret |= 0x03;
+        else if (mb == 4) ret |= 0x04;
+        return ret;
+    }
+    case 0x17: /* bus type: we're always the PCI variant */
+        return (s->cirrus_sr_ext[0x17] & ~(7 << 3)) | (4 << 3);
+    case 0x18:
+        return s->cirrus_sr_ext[0x18] & 0xfe;
+    default:
+        return s->cirrus_sr_ext[index & 0xff];
+    }
+}
+
+static void cirrus_gr_write(VGAState *s, int index, uint8_t val)
+{
+    if (index <= 8) {
+        if (index < 16)
+            s->gr[index] = val & gr_mask[index];
+        if (index == 0)
+            cirrus_blt_reg_write8(s, 0x00, val);
+        else if (index == 1)
+            cirrus_blt_reg_write8(s, 0x04, val);
+        return;
+    }
+    if (index >= 0x09 && index <= 0x0b) {
+        s->cirrus_bank_reg[index - 0x09] = val;
+        return;
+    }
+    if (index >= 0x0c && index <= 0x0e) {
+        s->cirrus_gr_ext[index - 0x0c] = val;
+        return;
+    }
+    /* Real hardware (and 86Box) gates SR06-unlock only on the legacy
+     * shadow-register readback, not on whether the underlying extended
+     * register actually does its job - the BLT engine and banking
+     * registers are always live. Gating this dispatch on cirrus_unlocked
+     * (as this code used to do) made the real Cirrus option ROM's own
+     * POST routine - which pokes several of these registers before it
+     * ever unlocks SR06 - silently no-op, which is what was driving it
+     * into a reset/retry loop. */
+    {
+        int off = cirrus_gr_to_mmio_off(index);
+        if (off >= 0)
+            cirrus_blt_reg_write8(s, off, val);
+#ifdef DEBUG_CIRRUS
+        else
+            printf("cirrus: gr_write unknown index=0x%02x val=0x%02x\n", index, val);
+#endif
+    }
+}
+
+static uint8_t cirrus_gr_read(VGAState *s, int index)
+{
+    /* GR0/GR1 are read back through the BLT engine's bg_col/fg_col
+     * (86Box vid_cl54xx.c:1618-1621, gd543x_mmio_read of 0xb8000/
+     * 0xb8004), not the plain shadow array - a guest that sets a color
+     * via direct MMIO and reads it back via the legacy port must see
+     * the same value. s->gr[0]/[1] still get written for symmetry but
+     * are never the read source. */
+    if (index == 0)
+        return cirrus_blt_reg_read8(s, 0x00);
+    if (index == 1)
+        return cirrus_blt_reg_read8(s, 0x04);
+    if (index <= 8)
+        return index < 16 ? s->gr[index] : 0xff;
+    if (index >= 0x09 && index <= 0x0b)
+        return s->cirrus_bank_reg[index - 0x09];
+    if (index >= 0x0c && index <= 0x0e)
+        return s->cirrus_gr_ext[index - 0x0c];
+    {
+        int off = cirrus_gr_to_mmio_off(index);
+        if (off >= 0)
+            return cirrus_blt_reg_read8(s, off);
+    }
+    return 0xff;
+}
+
 uint32_t vga_ioport_read(VGAState *s, uint32_t addr)
 {
     int val, index;
@@ -1383,22 +2170,62 @@ uint32_t vga_ioport_read(VGAState *s, uint32_t addr)
             val = s->st00;
             break;
         case 0x3c4:
-            val = s->sr_index;
+            /* Reading the index port back while a cursor X/Y register
+             * (0x10/0x11 or any of their 7 alias banks) is selected
+             * and the chip is unlocked returns packed position bits
+             * instead of the plain index (86Box vid_cl54xx.c:1291-
+             * 1302) - an oddity of real silicon some detection code
+             * checks for. */
+            if (s->card_type == VGA_CARD_CIRRUS && s->sr[6] == 0x12 &&
+                (s->sr_index & 0x1e) == 0x10) {
+                if (s->sr_index & 1)
+                    val = ((s->cirrus_cursor.y & 7) << 5) | 0x11;
+                else
+                    val = ((s->cirrus_cursor.x & 7) << 5) | 0x10;
+            } else {
+                val = s->sr_index;
+            }
             break;
         case 0x3c5:
-            val = s->sr[s->sr_index];
+            if (s->card_type == VGA_CARD_CIRRUS && s->sr_index > 7)
+                val = cirrus_sr_ext_read(s, s->sr_index);
+            else
+                val = s->sr[s->sr_index];
 #ifdef DEBUG_VGA_REG
             printf("vga: read SR%x = 0x%02x\n", s->sr_index, val);
 #endif
             break;
+        case 0x3c6:
+            if (s->card_type != VGA_CARD_CIRRUS) {
+                val = 0x00; /* unhandled on the plain Bochs path, as before */
+            } else if (s->cirrus_unlocked) {
+                if (s->cirrus_dac_state == 4) {
+                    s->cirrus_dac_state = 0; /* GD5430 isn't CLGD5428, always resets here */
+                    val = s->cirrus_dac_hidden;
+                } else {
+                    s->cirrus_dac_state++;
+                    val = (s->cirrus_dac_state == 4) ? s->cirrus_dac_hidden : 0xff;
+                }
+            } else {
+                val = 0xff;
+            }
+            break;
         case 0x3c7:
             val = s->dac_state;
+            s->cirrus_dac_state = 0;
             break;
         case 0x3c8:
             val = s->dac_write_index;
+            s->cirrus_dac_state = 0;
             break;
         case 0x3c9:
-            val = s->palette[s->dac_read_index * 3 + s->dac_sub_index];
+            s->cirrus_dac_state = 0;
+            if (s->card_type == VGA_CARD_CIRRUS && (s->cirrus_sr_ext[0x12] & 0x02)) {
+                int idx = s->dac_read_index & 0x0f;
+                val = s->cirrus_ext_palette[idx * 3 + s->dac_sub_index] & 0x3f;
+            } else {
+                val = s->palette[s->dac_read_index * 3 + s->dac_sub_index];
+            }
             if (++s->dac_sub_index == 3) {
                 s->dac_sub_index = 0;
                 s->dac_read_index++;
@@ -1411,10 +2238,13 @@ uint32_t vga_ioport_read(VGAState *s, uint32_t addr)
             val = s->msr;
             break;
         case 0x3ce:
-            val = s->gr_index;
+            val = (s->card_type == VGA_CARD_CIRRUS) ? (s->gr_index & 0x3f) : s->gr_index;
             break;
         case 0x3cf:
-            val = s->gr[s->gr_index];
+            if (s->card_type == VGA_CARD_CIRRUS)
+                val = cirrus_gr_read(s, s->gr_index);
+            else
+                val = s->gr[s->gr_index];
 #ifdef DEBUG_VGA_REG
             printf("vga: read GR%x = 0x%02x\n", s->gr_index, val);
 #endif
@@ -1425,7 +2255,33 @@ uint32_t vga_ioport_read(VGAState *s, uint32_t addr)
             break;
         case 0x3b5:
         case 0x3d5:
-            val = s->cr[s->cr_index];
+            /* CR0x27 is the hardwired chip ID on real Cirrus silicon; the
+             * in-box NT/9x drivers read it back to tell GD5430/34/36/46
+             * apart. Nothing else sets this (no per-device option ROM in
+             * tiny386), so without this the register reads back 0x00,
+             * which isn't a valid ID and confuses the driver. */
+            if (s->card_type == VGA_CARD_CIRRUS && s->cr_index == 0x27) {
+                val = 0xa0; /* CIRRUS_ID_CLGD5430 */
+            } else if (s->card_type == VGA_CARD_CIRRUS && s->cr_index == 0x28) {
+                /* "Class ID" - always 0xff on real GD5430/5440 silicon
+                 * (86Box vid_cl54xx.c:1652-1656). */
+                val = 0xff;
+            } else if (s->card_type == VGA_CARD_CIRRUS && s->cr_index == 0x22) {
+                /* Graphics Data Latches Readback Register: byte
+                 * (GR4 & 3) of the latch loaded by the last VRAM read
+                 * (86Box vid_cl54xx.c:1639-1642). */
+                val = (s->latch >> (8 * (s->gr[4] & 3))) & 0xff;
+            } else if (s->card_type == VGA_CARD_CIRRUS && s->cr_index == 0x24) {
+                /* Attribute controller flip-flop readback (86Box
+                 * vid_cl54xx.c:1643-1645). */
+                val = s->ar_flip_flop << 7;
+            } else if (s->card_type == VGA_CARD_CIRRUS && s->cr_index == 0x26) {
+                /* Attribute controller index readback (86Box
+                 * vid_cl54xx.c:1646-1648). */
+                val = s->ar_index & 0x3f;
+            } else {
+                val = s->cr[s->cr_index];
+            }
 #ifdef DEBUG_VGA_REG
             printf("vga: read CR%x = 0x%02x\n", s->cr_index, val);
 #endif
@@ -1436,6 +2292,9 @@ uint32_t vga_ioport_read(VGAState *s, uint32_t addr)
 //            s->st01 ^= ST01_V_RETRACE | ST01_DISP_ENABLE;
             val = s->st01;
             s->ar_flip_flop = 0;
+#ifdef DEBUG_VGA_REG
+            printf("vga: read ST01 = 0x%02x\n", val);
+#endif
             break;
         default:
             val = 0x00;
@@ -1497,34 +2356,80 @@ void vga_ioport_write(VGAState *s, uint32_t addr, uint32_t val)
         s->msr = val & ~0x10;
         break;
     case 0x3c4:
-        s->sr_index = val & 7;
+        s->sr_index = (s->card_type == VGA_CARD_CIRRUS) ? val : (val & 7);
         break;
     case 0x3c5:
 #ifdef DEBUG_VGA_REG
         printf("vga: write SR%x = 0x%02x\n", s->sr_index, val);
 #endif
-        s->sr[s->sr_index] = val & sr_mask[s->sr_index];
+        if (s->card_type == VGA_CARD_CIRRUS && s->sr_index == 6) {
+            /* SR06 is the Cirrus unlock register, not the reserved
+             * standard-VGA register sr_mask[6]=0x00 assumes. Real
+             * silicon stores only 0x12 (exact key match) or 0x0f back,
+             * never the raw written value (86Box vid_cl54xx.c:763-768).
+             * GD5430's chip ID (0xa0) is >= CIRRUS_ID_CLGD5429 (0x9c),
+             * so the extended-register lock is hardwired open from
+             * reset on this chip and SR06 never actually changes it -
+             * cirrus_unlocked is set once at card-type init and left
+             * alone here; only the read-back shadow is updated. */
+            uint8_t masked = val & 0x17;
+            s->sr[6] = (masked == 0x12) ? 0x12 : 0x0f;
+#ifdef DEBUG_CIRRUS
+            printf("cirrus: SR06=0x%02x -> shadow=0x%02x unlocked=%d\n", val, s->sr[6], s->cirrus_unlocked);
+#endif
+        } else if (s->card_type == VGA_CARD_CIRRUS && s->sr_index > 7) {
+            cirrus_sr_ext_write(s, s->sr_index, val);
+        } else {
+            s->sr[s->sr_index] = val & sr_mask[s->sr_index];
+        }
+        break;
+    case 0x3c6:
+        /* Hidden DAC control register: 4 consecutive reads of 0x3c6
+         * (with no intervening 0x3c7/0x3c8/0x3c9 access) prime the
+         * state machine, then a write captures the value (86Box
+         * vid_cl54xx.c:865-874). Only meaningful when unlocked, which
+         * is always true on GD5430 - see cirrus_unlocked above. We
+         * store the register faithfully but don't wire it to a real
+         * SVGA packed-pixel color-depth renderer (out of scope, same
+         * as the rest of the BPP>8 path - see vga_set_card_type). */
+        if (s->card_type == VGA_CARD_CIRRUS && s->cirrus_unlocked) {
+            if (s->cirrus_dac_state == 4)
+                s->cirrus_dac_hidden = val;
+            s->cirrus_dac_state = 0;
+        }
         break;
     case 0x3c7:
         s->dac_read_index = val;
         s->dac_sub_index = 0;
         s->dac_state = 3;
+        s->cirrus_dac_state = 0;
         break;
     case 0x3c8:
         s->dac_write_index = val;
         s->dac_sub_index = 0;
         s->dac_state = 0;
+        s->cirrus_dac_state = 0;
         break;
     case 0x3c9:
         s->dac_cache[s->dac_sub_index] = val;
+        s->cirrus_dac_state = 0;
         if (++s->dac_sub_index == 3) {
-            memcpy(&s->palette[s->dac_write_index * 3], s->dac_cache, 3);
+            /* SR0x12 bit1: redirect palette writes to the 16-entry
+             * extended palette instead of the standard 256-entry one
+             * (86Box vid_cl54xx.c:895-908) - used for the hardware
+             * cursor's background/foreground colors (entries 0/0xf). */
+            if (s->card_type == VGA_CARD_CIRRUS && (s->cirrus_sr_ext[0x12] & 0x02)) {
+                int idx = s->dac_write_index & 0x0f;
+                memcpy(&s->cirrus_ext_palette[idx * 3], s->dac_cache, 3);
+            } else {
+                memcpy(&s->palette[s->dac_write_index * 3], s->dac_cache, 3);
+            }
             s->dac_sub_index = 0;
             s->dac_write_index++;
         }
         break;
     case 0x3ce:
-        s->gr_index = val & 0x0f;
+        s->gr_index = (s->card_type == VGA_CARD_CIRRUS) ? val : (val & 0x0f);
         break;
     case 0x3cf:
 #ifdef DEBUG_VGA_REG
@@ -1532,7 +2437,10 @@ void vga_ioport_write(VGAState *s, uint32_t addr, uint32_t val)
 #endif
         if (s->gr_index == 0x06)
             s->comp_ntsc = 0;
-        s->gr[s->gr_index] = val & gr_mask[s->gr_index];
+        if (s->card_type == VGA_CARD_CIRRUS)
+            cirrus_gr_write(s, s->gr_index, val);
+        else
+            s->gr[s->gr_index] = val & gr_mask[s->gr_index];
         break;
     case 0x3b4:
     case 0x3d4:
@@ -1744,6 +2652,19 @@ static const uint32_t mask16[16] = {
 #define VGA_GFX_COMPARE_MASK    0x07
 #define VGA_GFX_BIT_MASK        0x08
 
+/* Cirrus extended bank registers (GR0x09/0x0A/0x0B) split the 64K window
+ * at A0000 into two independently bankable 32K halves selected by addr
+ * bit 15, per 86Box's gd54xx_recalc_banking()/gd54xx_write(). */
+static inline uint32_t cirrus_banked_addr(VGAState *s, uint32_t addr)
+{
+    int gr0b = s->cirrus_bank_reg[2];
+    int shift = (gr0b & 0x20) ? 14 : 12;
+    uint32_t bank0 = s->cirrus_bank_reg[0] << shift;
+    uint32_t bank1 = (gr0b & 0x01) ? (s->cirrus_bank_reg[1] << shift)
+                                    : (bank0 + 0x8000);
+    return (addr & 0x7fff) + (((addr >> 15) & 1) ? bank1 : bank0);
+}
+
 //#define DEBUG_VGA_MEM
 //#define TARGET_FMT_plx "%x"
 void IRAM_ATTR vga_mem_write16(VGAState *s, uint32_t addr, uint16_t val16)
@@ -1769,7 +2690,7 @@ void IRAM_ATTR vga_mem_write16(VGAState *s, uint32_t addr, uint16_t val16)
     case 1:
         if (addr >= 0x10000)
             return;
-        addr += s->bank_offset;
+        addr = (s->card_type == VGA_CARD_CIRRUS) ? cirrus_banked_addr(s, addr) : (addr + s->bank_offset);
         break;
     case 2:
         addr -= 0x10000;
@@ -1816,7 +2737,7 @@ void IRAM_ATTR vga_mem_write32(VGAState *s, uint32_t addr, uint32_t val)
     case 1:
         if (addr >= 0x10000)
             return;
-        addr += s->bank_offset;
+        addr = (s->card_type == VGA_CARD_CIRRUS) ? cirrus_banked_addr(s, addr) : (addr + s->bank_offset);
         break;
     case 2:
         addr -= 0x10000;
@@ -1859,7 +2780,7 @@ bool IRAM_ATTR vga_mem_write_string(VGAState *s, uint32_t addr, uint8_t *buf, in
     case 1:
         if (addr >= 0x10000)
             return false;
-        addr += s->bank_offset;
+        addr = (s->card_type == VGA_CARD_CIRRUS) ? cirrus_banked_addr(s, addr) : (addr + s->bank_offset);
         break;
     case 2:
         addr -= 0x10000;
@@ -1903,7 +2824,7 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
     case 1:
         if (addr >= 0x10000)
             return;
-        addr += s->bank_offset;
+        addr = (s->card_type == VGA_CARD_CIRRUS) ? cirrus_banked_addr(s, addr) : (addr + s->bank_offset);
         break;
     case 2:
         addr -= 0x10000;
@@ -2040,7 +2961,7 @@ uint8_t vga_mem_read(VGAState *s, uint32_t addr)
     case 1:
         if (addr >= 0x10000)
             return 0xff;
-        addr += s->bank_offset;
+        addr = (s->card_type == VGA_CARD_CIRRUS) ? cirrus_banked_addr(s, addr) : (addr + s->bank_offset);
         break;
     case 2:
         addr -= 0x10000;
@@ -2131,11 +3052,26 @@ void vga_set_force_8dm(VGAState *s, int v)
     s->force_8dm = v;
 }
 
+void vga_set_card_type(VGAState *s, int card_type)
+{
+    s->card_type = card_type;
+    /* GD5430 (CR0x27=0xa0) is >= CIRRUS_ID_CLGD5429: the extended
+     * register lock is hardwired open from reset on real silicon and
+     * SR06 writes never change it (86Box vid_cl54xx.c:4211-4214). */
+    if (card_type == VGA_CARD_CIRRUS)
+        s->cirrus_unlocked = 1;
+}
+
 PCIDevice *vga_pci_init(VGAState *s, PCIBus *bus,
                         void *o, void (*set_bar)(void *, int, uint32_t, bool))
 {
     PCIDevice *d;
-    d = pci_register_device(bus, "VGA", -1, 0x1234, 0x1111, 0x00, 0x0300);
+    if (s->card_type == VGA_CARD_CIRRUS) {
+        /* Cirrus Logic GD5430 */
+        d = pci_register_device(bus, "VGA", -1, 0x1013, 0x00a0, 0x00, 0x0300);
+    } else {
+        d = pci_register_device(bus, "VGA", -1, 0x1234, 0x1111, 0x00, 0x0300);
+    }
 
     uint32_t bar_size;
     bar_size = 1;
