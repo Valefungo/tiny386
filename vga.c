@@ -109,7 +109,12 @@ struct VGAState {
     uint8_t gr_index;
     uint8_t gr[16];
     uint8_t ar_index;
-    uint8_t ar[21];
+    /* Standard VGA only defines indices 0x00-0x14 (21 registers); Cirrus
+     * extends the index mask to 0x1f but indices 0x15-0x1f have no
+     * defined function either (vid_cl54xx.c just stores the raw byte
+     * unconditionally before its index-specific switch) - sized to 32 so
+     * those still round-trip instead of being silently dropped. */
+    uint8_t ar[32];
     int ar_flip_flop;
     uint8_t cr_index;
     uint8_t cr[256]; /* CRT registers */
@@ -166,11 +171,15 @@ struct VGAState {
      * trusting the rest of the Cirrus register set. */
     uint8_t cirrus_bank_reg[3];
     /* GR0x0C/0x0D: overlay color-key compare value/mask. GR0x0E: DPMS
-     * control (5429+). Video overlay compositing and DPMS power
-     * signaling aren't implemented (no second video plane / no host
-     * power-state concept to drive) - stored only so reads round-trip
-     * what was written, like the VCLK/bus-config SR registers above. */
-    uint8_t cirrus_gr_ext[3];
+     * control (5429+). GR0x0F: no defined function on real hardware
+     * either, but 86Box still round-trips it via the raw gdcreg[] shadow
+     * (vid_cl54xx.c:1614-1625, the gdcaddr<0x10 catch-all branch returns
+     * the stored byte, NOT 0xff like the >=0x10-unmapped case does).
+     * Video overlay compositing and DPMS power signaling aren't
+     * implemented (no second video plane / no host power-state concept
+     * to drive) - stored only so reads round-trip what was written, like
+     * the VCLK/bus-config SR registers above. */
+    uint8_t cirrus_gr_ext[4];
     /* Extended Sequencer registers 0x08-0xFF: raw round-trip storage
      * for everything we don't otherwise special-case (VCLK dividers,
      * DRAM control, bus-type/MMIO config, I2C/DDC, misc control) -
@@ -186,6 +195,22 @@ struct VGAState {
     uint8_t cirrus_ext_palette[16 * 3]; /* extended palette, 16 RGB entries (6-bit) */
     uint8_t cirrus_dac_state; /* hidden DAC register read state machine (0x3c6) */
     uint8_t cirrus_dac_hidden; /* hidden DAC control register value */
+    /* I2C/DDC bit-bang state machine for SR0x08 (86Box i2c_gpio.c), plus
+     * a virtual EDID EEPROM slave at address 0x50 (86Box i2c_eeprom.c).
+     * Without a slave actually answering DDC reads, Windows falls back
+     * to a conservative "Default Monitor" profile that caps the usable
+     * resolution well below what the video card itself supports. */
+    struct {
+        uint8_t prev_scl, prev_sda;
+        uint8_t started;
+        uint8_t pos;
+        uint8_t byte;
+        uint8_t slave_addr; /* 0xff = none selected */
+        uint8_t slave_read; /* 0/1=write/read transfer, 2=address phase, |0x80 flag */
+        uint8_t slave_sda;  /* ack/data bit driven by the slave device */
+        uint8_t edid_addr;  /* current EDID EEPROM read/write offset */
+        uint8_t wrote_offset; /* the one offset-setting byte of a write transfer was consumed */
+    } cirrus_i2c;
     struct cirrus_blt_s {
         uint32_t bg_col, fg_col;
         uint16_t width, height, dst_pitch, src_pitch;
@@ -1989,6 +2014,121 @@ static int cirrus_gr_to_mmio_off(int gr_index)
     }
 }
 
+/* Default monitor EDID (128-byte base block + 128-byte extension block),
+ * byte-for-byte identical to 86Box's ddc_create_default_edid()
+ * (vid_ddc.c) - established_timings/standard_timings/range-limits wide
+ * enough that real display drivers offer resolutions well above
+ * 1024x768, unlike the conservative built-in "Default Monitor" profile
+ * Windows falls back to when DDC reads get no answer at all. */
+static const uint8_t cirrus_edid[256] = {
+0x00,0xff,0xff,0xff,0xff,0xff,0xff,0x00,0x09,0xf8,0x00,0x00,
+0x00,0x00,0x00,0x00,0x30,0x1e,0x01,0x04,0x0e,0x15,0x10,0x00,
+0xeb,0x81,0xf1,0xa3,0x57,0x53,0x9f,0x27,0x0a,0x50,0x00,0xff,
+0xff,0xff,0x81,0xc0,0x81,0x00,0x8b,0xc0,0x95,0x00,0xa9,0xc0,
+0xa9,0x40,0xd1,0xc0,0xe1,0x40,0xa0,0x0f,0x20,0x00,0x31,0x58,
+0x1c,0x20,0x28,0x80,0x14,0x00,0xd3,0x9e,0x00,0x00,0x00,0x00,
+0x00,0x00,0x00,0xf7,0x00,0x0a,0xff,0xff,0xff,0xff,0xff,0xf0,
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xfd,0x00,0x2d,
+0x7d,0x1e,0x73,0x1e,0x00,0x0a,0x20,0x20,0x20,0x20,0x20,0x20,
+0x00,0x00,0x00,0xfc,0x00,0x38,0x36,0x42,0x6f,0x78,0x20,0x4d,
+0x6f,0x6e,0x69,0x74,0x6f,0x72,0x01,0xa9,0x02,0x03,0x04,0x80,
+0x66,0x21,0x56,0xaa,0x51,0x00,0x1e,0x30,0x46,0x8f,0x33,0x00,
+0xd3,0x9e,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xfa,0x00,0x31,
+0x59,0x45,0x59,0x61,0x59,0x81,0x99,0xa9,0x59,0xb3,0x00,0x0a,
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+0x00,0x00,0x00,0x23,
+};
+
+/* Bit-bang I2C/DDC state machine for SR0x08, ported from 86Box's
+ * i2c_gpio_set() (i2c_gpio.c), with a single hardwired read-only EDID
+ * EEPROM slave at address 0x50 standing in for vid_ddc.c's
+ * ddc_init()+i2c_eeprom_init(). Real DDC2B reads only ever do a single
+ * "set offset, then read N sequential bytes" transaction, so only that
+ * shape is modeled; a second write byte (which would normally write
+ * EEPROM data) just NACKs since the EDID is read-only. */
+static void cirrus_i2c_set(VGAState *s, int scl, int sda)
+{
+    scl = !!scl;
+    sda = !!sda;
+    if (s->cirrus_i2c.prev_scl && scl) {
+        if (s->cirrus_i2c.prev_sda && !sda) {
+            /* start (or repeated start) condition */
+            s->cirrus_i2c.started = 1;
+            s->cirrus_i2c.pos = 0;
+            s->cirrus_i2c.slave_addr = 0xff;
+            s->cirrus_i2c.slave_read = 2;
+            s->cirrus_i2c.slave_sda = 1;
+            s->cirrus_i2c.wrote_offset = 0;
+        } else if (!s->cirrus_i2c.prev_sda && sda) {
+            /* stop condition */
+            s->cirrus_i2c.started = 0;
+            s->cirrus_i2c.slave_addr = 0xff;
+            s->cirrus_i2c.slave_sda = 1;
+        }
+    } else if (!s->cirrus_i2c.prev_scl && scl && s->cirrus_i2c.started) {
+        if (s->cirrus_i2c.pos++ < 8) {
+            if (s->cirrus_i2c.slave_read == 1) {
+                s->cirrus_i2c.slave_sda = !!(s->cirrus_i2c.byte & 0x80);
+                s->cirrus_i2c.byte <<= 1;
+            } else {
+                s->cirrus_i2c.byte <<= 1;
+                s->cirrus_i2c.byte |= sda;
+            }
+        }
+        if (s->cirrus_i2c.pos == 8) {
+            switch (s->cirrus_i2c.slave_read) {
+            case 2: /* address byte just received */
+                s->cirrus_i2c.slave_addr = s->cirrus_i2c.byte >> 1;
+                s->cirrus_i2c.slave_read = s->cirrus_i2c.byte & 1;
+                if (s->cirrus_i2c.slave_addr == 0x50) {
+                    s->cirrus_i2c.slave_sda = 0; /* ACK */
+                    if (s->cirrus_i2c.slave_read)
+                        s->cirrus_i2c.byte = cirrus_edid[s->cirrus_i2c.edid_addr];
+#ifdef DEBUG_CIRRUS
+                    printf("cirrus: i2c EDID slave selected for %s at offset 0x%02x\n",
+                           s->cirrus_i2c.slave_read ? "read" : "write", s->cirrus_i2c.edid_addr);
+#endif
+                } else {
+                    s->cirrus_i2c.slave_sda = 1; /* NACK: no device here */
+                }
+                s->cirrus_i2c.slave_read |= 0x80;
+                break;
+            case 0: /* write transfer byte */
+                if (s->cirrus_i2c.slave_addr == 0x50 && !s->cirrus_i2c.wrote_offset) {
+                    s->cirrus_i2c.edid_addr = s->cirrus_i2c.byte;
+                    s->cirrus_i2c.wrote_offset = 1;
+                    s->cirrus_i2c.slave_sda = 0; /* ACK */
+                } else {
+                    s->cirrus_i2c.slave_sda = 1; /* NACK: read-only past the offset byte */
+                }
+                break;
+            default:
+                break;
+            }
+        } else if (s->cirrus_i2c.pos == 9) {
+            if ((s->cirrus_i2c.slave_read & 0x7f) == 1) {
+                if (!sda) { /* master ACKed: advance to the next byte */
+                    s->cirrus_i2c.edid_addr++;
+                    s->cirrus_i2c.byte = cirrus_edid[s->cirrus_i2c.edid_addr];
+                }
+            } else {
+                s->cirrus_i2c.slave_read &= 1;
+            }
+            s->cirrus_i2c.pos = 0;
+        }
+    } else if (s->cirrus_i2c.prev_scl && !scl && (s->cirrus_i2c.pos != 8)) {
+        s->cirrus_i2c.slave_sda = 1;
+    }
+    s->cirrus_i2c.prev_scl = scl;
+    s->cirrus_i2c.prev_sda = sda;
+}
+
 /* Extended Sequencer registers (index > 7). Formulas match 86Box
  * vid_cl54xx.c:760-857 (gd54xx_out, case 0x3c5). Memory-size scratch
  * pads (0x0a/0x15), VCLK dividers (0x0b-0x0e/0x1b-0x1e), DRAM control
@@ -2002,6 +2142,9 @@ static void cirrus_sr_ext_write(VGAState *s, int index, uint8_t val)
 {
     s->cirrus_sr_ext[index & 0xff] = val;
     switch (index) {
+    case 0x08: /* I2C/DDC GPIO: write bit0=SCL, bit1=SDA (86Box vid_cl54xx.c:772-775) */
+        cirrus_i2c_set(s, val & 0x01, val & 0x02);
+        break;
     case 0x10: case 0x30: case 0x50: case 0x70:
     case 0x90: case 0xb0: case 0xd0: case 0xf0:
         s->cirrus_cursor.x = ((int)val << 3) | (index >> 5);
@@ -2040,10 +2183,13 @@ static uint8_t cirrus_sr_ext_read(VGAState *s, int index)
     int kb = s->vga_ram_size >> 10;
     switch (index) {
     case 0x08: { /* I2C/DDC GPIO read-back (different bit positions
-                  * than the write side - 86Box vid_cl54xx.c:1315-1323) */
+                  * than the write side - 86Box vid_cl54xx.c:1315-1323).
+                  * SDA reflects the wired-AND of our own output and the
+                  * EDID slave's response, not a plain loopback of what
+                  * was last written. */
         uint8_t ret = s->cirrus_sr_ext[0x08] & 0x7b;
-        if (s->cirrus_sr_ext[0x08] & 0x01) ret |= 0x04; /* SCL */
-        if (s->cirrus_sr_ext[0x08] & 0x02) ret |= 0x80; /* SDA */
+        if (s->cirrus_i2c.prev_scl) ret |= 0x04; /* SCL */
+        if (s->cirrus_i2c.prev_sda && s->cirrus_i2c.slave_sda) ret |= 0x80; /* SDA */
         return ret;
     }
     case 0x0a: { /* Scratch Pad 1 (memory size, 5402/542x-style) */
@@ -2093,7 +2239,7 @@ static void cirrus_gr_write(VGAState *s, int index, uint8_t val)
         s->cirrus_bank_reg[index - 0x09] = val;
         return;
     }
-    if (index >= 0x0c && index <= 0x0e) {
+    if (index >= 0x0c && index <= 0x0f) {
         s->cirrus_gr_ext[index - 0x0c] = val;
         return;
     }
@@ -2132,8 +2278,10 @@ static uint8_t cirrus_gr_read(VGAState *s, int index)
         return index < 16 ? s->gr[index] : 0xff;
     if (index >= 0x09 && index <= 0x0b)
         return s->cirrus_bank_reg[index - 0x09];
-    if (index >= 0x0c && index <= 0x0e)
+    if (index >= 0x0c && index <= 0x0f)
         return s->cirrus_gr_ext[index - 0x0c];
+    if (index == 0x3f)
+        return 0x00; /* vportsync toggle, GD5446-only - fixed 0 on GD5430 (vid_cl54xx.c:1605-1609) */
     {
         int off = cirrus_gr_to_mmio_off(index);
         if (off >= 0)
@@ -2161,10 +2309,7 @@ uint32_t vga_ioport_read(VGAState *s, uint32_t addr)
             break;
         case 0x3c1:
             index = s->ar_index & 0x1f;
-            if (index < 21)
-                val = s->ar[index];
-            else
-                val = 0;
+            val = s->ar[index];
             break;
         case 0x3c2:
             val = s->st00;
@@ -2347,6 +2492,10 @@ void vga_ioport_write(VGAState *s, uint32_t addr, uint32_t val)
                 s->ar[index] = val & ~0xf0;
                 break;
             default:
+                /* Indices 0x15-0x1f: no defined function, but 86Box
+                 * still stores the raw byte unconditionally before
+                 * dispatching on index (vid_cl54xx.c ~707-711). */
+                s->ar[index] = val;
                 break;
             }
         }
@@ -2381,6 +2530,10 @@ void vga_ioport_write(VGAState *s, uint32_t addr, uint32_t val)
             cirrus_sr_ext_write(s, s->sr_index, val);
         } else {
             s->sr[s->sr_index] = val & sr_mask[s->sr_index];
+#ifdef DEBUG_CIRRUS
+            if (s->card_type == VGA_CARD_CIRRUS && s->sr_index == 7)
+                printf("cirrus: SR07 write val=0x%02x\n", val);
+#endif
         }
         break;
     case 0x3c6:
@@ -2393,8 +2546,12 @@ void vga_ioport_write(VGAState *s, uint32_t addr, uint32_t val)
          * SVGA packed-pixel color-depth renderer (out of scope, same
          * as the rest of the BPP>8 path - see vga_set_card_type). */
         if (s->card_type == VGA_CARD_CIRRUS && s->cirrus_unlocked) {
-            if (s->cirrus_dac_state == 4)
+            if (s->cirrus_dac_state == 4) {
                 s->cirrus_dac_hidden = val;
+#ifdef DEBUG_CIRRUS
+                printf("cirrus: hidden DAC ctrl write val=0x%02x\n", val);
+#endif
+            }
             s->cirrus_dac_state = 0;
         }
         break;
@@ -2450,6 +2607,10 @@ void vga_ioport_write(VGAState *s, uint32_t addr, uint32_t val)
     case 0x3d5:
 #ifdef DEBUG_VGA_REG
         printf("vga: write CR%x = 0x%02x\n", s->cr_index, val);
+#endif
+#ifdef DEBUG_CIRRUS
+        if (s->card_type == VGA_CARD_CIRRUS)
+            printf("cirrus: CR%02x write val=0x%02x\n", s->cr_index, val);
 #endif
         /* handle CR0-7 protection */
         if ((s->cr[0x11] & 0x80) && s->cr_index <= 7) {
@@ -3058,8 +3219,27 @@ void vga_set_card_type(VGAState *s, int card_type)
     /* GD5430 (CR0x27=0xa0) is >= CIRRUS_ID_CLGD5429: the extended
      * register lock is hardwired open from reset on real silicon and
      * SR06 writes never change it (86Box vid_cl54xx.c:4211-4214). */
-    if (card_type == VGA_CARD_CIRRUS)
+    if (card_type == VGA_CARD_CIRRUS) {
         s->cirrus_unlocked = 1;
+        /* VCLK numerator/denominator reset defaults for chip ID >=
+         * CIRRUS_ID_CLGD5420 (true for GD5430=0xa0), 86Box
+         * vid_cl54xx.c:4180-4188. These four clock-select slots back the
+         * standard 2-bit MISC-register clock select and are non-zero on
+         * real silicon from power-on, not something the BIOS/driver
+         * necessarily reprograms before relying on them - leaving them
+         * at zero (the default cirrus_sr_ext[] state) would make any
+         * mode that picks an unprogrammed clocksel slot compute a
+         * bogus/zero pixel clock. */
+        s->cirrus_sr_ext[0x0b] = 0x4a; s->cirrus_sr_ext[0x1b] = 0x2b;
+        s->cirrus_sr_ext[0x0c] = 0x5b; s->cirrus_sr_ext[0x1c] = 0x2f;
+        s->cirrus_sr_ext[0x0d] = 0x45; s->cirrus_sr_ext[0x1d] = 0x30;
+        s->cirrus_sr_ext[0x0e] = 0x7e; s->cirrus_sr_ext[0x1e] = 0x33;
+        /* I2C bus idles high (pulled up), matching 86Box's i2c_gpio_init(). */
+        s->cirrus_i2c.prev_scl = 1;
+        s->cirrus_i2c.prev_sda = 1;
+        s->cirrus_i2c.slave_sda = 1;
+        s->cirrus_i2c.slave_addr = 0xff;
+    }
 }
 
 PCIDevice *vga_pci_init(VGAState *s, PCIBus *bus,

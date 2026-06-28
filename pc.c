@@ -904,6 +904,17 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
 	pc->boot_start_time = 0;
 
 	pc->vga_mem_size = conf->vga_mem_size;
+	if (conf->vga_card == VGA_CARD_CIRRUS && pc->vga_mem_size > 2 * 1024 * 1024) {
+		/* Real GD5430 silicon tops out at 2MB - SR0x0F/0x15's memory-size
+		 * scratch pads have no encoding above that for this chip ID, and
+		 * reporting more than the real hardware ever could confuses the
+		 * NT/9x miniport driver into refusing to switch to higher
+		 * resolutions/color depths (zero hardware register I/O on the
+		 * rejected attempt - it's a software capability-table decision). */
+		fprintf(stderr, "cirrus: clamping vga_mem_size from %d to 2M "
+			"(real GD5430 hardware maximum)\n", pc->vga_mem_size);
+		pc->vga_mem_size = 2 * 1024 * 1024;
+	}
 	pc->vga_mem = bigmalloc(pc->vga_mem_size);
 	memset(pc->vga_mem, 0, pc->vga_mem_size);
 	pc->vga = vga_init(pc->vga_mem, pc->vga_mem_size,
