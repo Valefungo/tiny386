@@ -44,7 +44,7 @@ void *pcmalloc(long size);
 
 //#define DEBUG_VBE
 //#define DEBUG_VGA_REG
-#define DEBUG_CIRRUS
+//#define DEBUG_CIRRUS
 
 #define MSR_COLOR_EMULATION 0x01
 #define MSR_PAGE_SELECT     0x20
