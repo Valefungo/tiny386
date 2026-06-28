@@ -20,5 +20,9 @@ if(EXISTS "${BOARD_SDKCONFIG}")
 endif()
 set(SDKCONFIG_DEFAULTS "${BOARD_SDKCONFIG}")
 
+# Local components (e.g. esp_lcd_st7121, m5_tab5_keyboard_component for the
+# tab5 board) live here instead of the registry.
+list(APPEND EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/components")
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(tiny386)
