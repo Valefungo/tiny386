@@ -1,3 +1,4 @@
+//#define DEBUG_CIRRUS_LFB
 #include "pc.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -273,6 +274,21 @@ static u16 pc_io_read16(void *o, int addr)
 	switch(addr) {
 	case 0x1ce: case 0x1cf:
 		val = vbe_read(pc->vga, addr - 0x1ce);
+		return val;
+	case 0x3c0: case 0x3c1: case 0x3c2: case 0x3c3:
+	case 0x3c4: case 0x3c5: case 0x3c6: case 0x3c7:
+	case 0x3c8: case 0x3c9: case 0x3ca: case 0x3cb:
+	case 0x3cc: case 0x3cd: case 0x3ce: case 0x3cf:
+	case 0x3d0: case 0x3d1: case 0x3d2: case 0x3d3:
+	case 0x3d4: case 0x3d5: case 0x3d6: case 0x3d7:
+	case 0x3d8: case 0x3d9: case 0x3da: case 0x3db:
+	case 0x3dc: case 0x3dd: case 0x3de:
+		/* mirrors pc_io_write16: a 16-bit access on these 8-bit VGA
+		 * register ports is just two consecutive 8-bit cycles on the
+		 * bus, low byte at addr, high byte at addr+1 - some Cirrus
+		 * Win9x miniport code reads SR/CR index registers this way. */
+		val = vga_ioport_read(pc->vga, addr);
+		val |= (u16) vga_ioport_read(pc->vga, addr + 1) << 8;
 		return val;
 	case 0x1f0:
 		val = ide_data_readw(pc->ide);
@@ -614,6 +630,9 @@ static void set_irq(void *o, int irq, int level)
 static void set_pci_vga_bar(void *opaque, int bar_num, uint32_t addr, bool enabled)
 {
 	PC *pc = opaque;
+#ifdef DEBUG_CIRRUS_LFB
+	fprintf(stderr, "set_pci_vga_bar bar_num=%d addr=0x%x enabled=%d\n", bar_num, addr, enabled);
+#endif
 	if (enabled)
 		pc->pci_vga_ram_addr = addr;
 	else
@@ -693,10 +712,25 @@ static void iomem_write8(void *iomem, uword addr, u8 val)
 			cirrus_blt_mmio_write8(pc->vga, off, val);
 			return;
 		}
-		if (addr < pc->vga_mem_size)
+		if (pc->vga_card_is_cirrus && cirrus_mem_sys_src_write(pc->vga, val))
+			return;
+		if (addr < pc->vga_mem_size) {
+#ifdef DEBUG_CIRRUS_LFB
+			static int n = 0;
+			if (n++ < 60 || (n % 10000) == 0)
+				fprintf(stderr, "lfb_write8 off=0x%x val=0x%02x n=%d\n", addr, val, n);
+#endif
 			pc->vga_mem[addr] = val;
+		}
 		return;
 	}
+#ifdef DEBUG_CIRRUS_LFB
+	{
+		static int n = 0;
+		if (n++ < 60)
+			fprintf(stderr, "a0000_write8 off=0x%x val=0x%02x n=%d\n", addr - 0xa0000, val, n);
+	}
+#endif
 	vga_mem_write(pc->vga, addr - 0xa0000, val);
 }
 
@@ -724,8 +758,18 @@ static void iomem_write16(void *iomem, uword addr, u16 val)
 			cirrus_blt_mmio_write8(pc->vga, off + 1, val >> 8);
 			return;
 		}
-		if (addr + 1 < pc->vga_mem_size)
+		if (pc->vga_card_is_cirrus && cirrus_mem_sys_src_write(pc->vga, val & 0xff)) {
+			cirrus_mem_sys_src_write(pc->vga, val >> 8);
+			return;
+		}
+		if (addr + 1 < pc->vga_mem_size) {
+#ifdef DEBUG_CIRRUS_LFB
+			static int n = 0;
+			if (n++ < 60)
+				fprintf(stderr, "lfb_write16 off=0x%x val=0x%04x n=%d\n", addr, val, n);
+#endif
 			*(uint16_t *)&(pc->vga_mem[addr]) = val;
+		}
 		return;
 	}
 	vga_mem_write16(pc->vga, addr - 0xa0000, val);
@@ -760,8 +804,20 @@ static void iomem_write32(void *iomem, uword addr, u32 val)
 			cirrus_blt_mmio_write8(pc->vga, off + 3, (val >> 24) & 0xff);
 			return;
 		}
-		if (addr + 3 < pc->vga_mem_size)
+		if (pc->vga_card_is_cirrus && cirrus_mem_sys_src_write(pc->vga, val & 0xff)) {
+			cirrus_mem_sys_src_write(pc->vga, (val >> 8) & 0xff);
+			cirrus_mem_sys_src_write(pc->vga, (val >> 16) & 0xff);
+			cirrus_mem_sys_src_write(pc->vga, (val >> 24) & 0xff);
+			return;
+		}
+		if (addr + 3 < pc->vga_mem_size) {
+#ifdef DEBUG_CIRRUS_LFB
+			static int n = 0;
+			if (n++ < 60)
+				fprintf(stderr, "lfb_write32 off=0x%x val=0x%08x n=%d\n", addr, val, n);
+#endif
 			*(uint32_t *)&(pc->vga_mem[addr]) = val;
+		}
 		return;
 	}
 	vga_mem_write32(pc->vga, addr - 0xa0000, val);
@@ -788,7 +844,18 @@ static bool iomem_write_string(void *iomem, uword addr, uint8_t *buf, int len)
 				cirrus_blt_mmio_write8(pc->vga, off + i, buf[i]);
 			return true;
 		}
+		if (pc->vga_card_is_cirrus && cirrus_mem_sys_src_write(pc->vga, buf[0])) {
+			int i;
+			for (i = 1; i < len; i++)
+				cirrus_mem_sys_src_write(pc->vga, buf[i]);
+			return true;
+		}
 		if (addr + len < pc->vga_mem_size) {
+#ifdef DEBUG_CIRRUS_LFB
+			static int n = 0;
+			if (n++ < 60)
+				fprintf(stderr, "lfb_write_string off=0x%x len=%d n=%d\n", addr, len, n);
+#endif
 			memcpy(pc->vga_mem + addr, buf, len);
 			return true;
 		}

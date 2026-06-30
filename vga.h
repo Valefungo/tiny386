@@ -23,6 +23,7 @@ uint8_t cirrus_blt_mmio_read8(VGAState *s, uint32_t off);
 void cirrus_blt_mmio_write8(VGAState *s, uint32_t off, uint8_t val);
 int vga_cirrus_mmio_active(VGAState *s);
 int vga_cirrus_mmio_use_pciaddr(VGAState *s);
+int cirrus_mem_sys_src_write(VGAState *s, uint8_t val);
 
 int vga_step(VGAState *vga);
 void vga_refresh(VGAState *s,

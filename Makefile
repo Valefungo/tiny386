@@ -103,7 +103,7 @@ PROGS_ = tiny386 tiny386_headless wifikbd initnet
 PROGS_win32 = tiny386 tiny386_headless wifikbd
 PROGS = ${PROGS_${PLAT}}
 
-SRCS += ini.c fpu.c i8259.c i8254.c ide.c vga.c i8042.c misc.c adlib.c ne2000.c i8257.c sb16.c pcspk.c
+SRCS += ini.c fpu.c i8259.c i8254.c ide.c vga.c vga_bochs.c vga_cirrus.c i8042.c misc.c adlib.c ne2000.c i8257.c sb16.c pcspk.c
 SRCS += ${FMOPL_${USE_FMOPL}}
 SRCS += ${CPUABS_${USE_CPUABS}}
 SRCS += pc.c
