@@ -559,7 +559,9 @@ static void vga_text_refresh(VGAState *s,
     start_addr = s->cr[0x0d] | (s->cr[0x0c] << 8);
     if (s->card_type == VGA_CARD_CIRRUS)
         cirrus_get_extended_addr(s, &start_addr, &line_offset);
-    line_offset <<= 3;
+    /* CRTC word mode: cell k sits at plane address 2k, i.e. 8 bytes per
+     * cell in the interleaved layout (matches the odd/even CPU mapping) */
+    line_offset <<= 4;
 
     cheight = (s->cr[9] & 0x1f) + 1;
     cwidth = 8;
@@ -635,8 +637,8 @@ static void vga_text_refresh(VGAState *s,
         s->last_cursor_end = cursor_end;
     }
 
-    ch_addr1 = (start_addr * 4);
-    cursor_offset = (start_addr + cursor_offset) * 4;
+    ch_addr1 = (start_addr * 8);
+    cursor_offset = (start_addr + cursor_offset) * 8;
 
 #if 0
     printf("text refresh %dx%d font=%dx%d start_addr=0x%x line_offset=0x%x\n",
@@ -652,7 +654,7 @@ static void vga_text_refresh(VGAState *s,
     {
     int yt = 0;
     int yy = 0;
-    ch_addr1 = (start_addr * 4) + cxbegin * 4;
+    ch_addr1 = (start_addr * 8) + cxbegin * 8;
 #endif
     for(cy = 0; cy < height; cy++) {
         ch_addr = ch_addr1;
@@ -668,7 +670,7 @@ static void vga_text_refresh(VGAState *s,
 #else
         for(cx = 0; cx < width; cx++) {
 #endif
-            ch_attr = *(uint16_t *)(vga_ram + (ch_addr & 0x1fffe));
+            ch_attr = *(uint16_t *)(vga_ram + (ch_addr & 0x3fffe));
 #ifdef FULL_UPDATE
             if (1) {
 #else
@@ -717,7 +719,7 @@ static void vga_text_refresh(VGAState *s,
                     }
                 }
             }
-            ch_addr += 4;
+            ch_addr += 8;
             dst += (BPP / 8) * cwidth;
         }
 #if defined(SCALE_3_2) || defined(SCALE_2_1) || defined(SWAPXY)
@@ -781,6 +783,56 @@ static void vga_text_refresh(VGAState *s,
     redraw_func(opaque, 0, 0, fb_dev->width, fb_dev->height);
 }
 
+/* ---- DEBUG_BAND (see vga_internal.h): instrumentation for the Win3.11
+ * stale-band bug. Watch ranges (vga_ram byte offsets):
+ *   band     = 0x14000..0x20400  (visible rows 256..409 in 640x480 planar)
+ *   offscreen= 0x25800..0x40000  (past the visible framebuffer, Windows save area)
+ * Logs every store from every write branch that lands in a watch range,
+ * with the register state, so the mapping that put data there is visible. */
+#ifdef DEBUG_BAND
+static uint64_t band_op;
+static uint32_t band_rr_addr[8], band_rr_val[8];
+static unsigned band_rr_i;
+static uint32_t band_cnt[6];
+static uint32_t band_logged[6];
+static const char *band_branch[6] = {"planar","oddeven","chain4","c4w16","c4w32","c4str"};
+
+static inline int band_hit(uint32_t byteaddr)
+{
+    return (byteaddr >= 0x14000 && byteaddr < 0x20400) ||
+           (byteaddr >= 0x25800 && byteaddr < 0x40000);
+}
+
+static void band_reads_dump(void)
+{
+    printf("BAND_READS ");
+    for (int k = 0; k < 8; k++) {
+        unsigned j = (band_rr_i - 1 - k) & 7;
+        printf("%05x:%08x ", band_rr_addr[j], band_rr_val[j]);
+    }
+    printf("\n");
+}
+
+static void band_store_log(VGAState *s, int br, uint32_t inaddr,
+                           uint32_t dst, uint32_t val, int nbytes)
+{
+    band_op++;
+    if (!band_hit(dst) && !band_hit(dst + nbytes - 1))
+        return;
+    band_cnt[br]++;
+    if (band_logged[br] < 600 || (band_cnt[br] & 1023) == 0) {
+        band_logged[br]++;
+        printf("BAND_STORE br=%s in=0x%05x dst=0x%05x val=0x%08x n=%d "
+               "gr5=%02x gr6=%02x gr8=%02x sr2=%02x sr4=%02x "
+               "gr0=%02x gr1=%02x gr3=%02x bank=0x%x op=%llu\n",
+               band_branch[br], inaddr, dst, val, nbytes,
+               s->gr[5], s->gr[6], s->gr[8], s->sr[2], s->sr[4],
+               s->gr[0], s->gr[1], s->gr[3], s->bank_offset,
+               (unsigned long long)band_op);
+    }
+}
+#endif
+
 static void vga_graphic_refresh(VGAState *s,
                                 SimpleFBDrawFunc *redraw_func, void *opaque,
                                 int full_update)
@@ -793,6 +845,14 @@ static void vga_graphic_refresh(VGAState *s,
     h++;
 
     int shift_control = (s->gr[0x05] >> 5) & 3;
+    /* CRTC word mode (CR17 bit6=0 and not dword mode CR14 bit6): the
+     * address counter is shifted left once during fetch, so scanline
+     * data sits at doubled plane addresses (CGA modes 4/5, matching the
+     * odd/even CPU mapping). Keyed off stable CRTC state - NOT GR5
+     * bit4, which the guest toggles transiently during VDD save/restore
+     * cycles while the visible mode is planar. */
+    int cga2 = (!vbe_enabled(s) &&
+                !(s->cr[0x17] & 0x40) && !(s->cr[0x14] & 0x40)) ? 1 : 0;
     int double_scan = (s->cr[0x09] >> 7);
     int multi_scan, multi_run;
     if (!double_scan) {
@@ -808,7 +868,7 @@ static void vga_graphic_refresh(VGAState *s,
     uint32_t line_offset = s->cr[0x13];
     if (s->card_type == VGA_CARD_CIRRUS)
         cirrus_get_extended_addr(s, &start_addr, &line_offset);
-    line_offset <<= 3;
+    line_offset <<= 3 + cga2;
 //    uint32_t line_compare = s->cr[0x18] |
 //        ((s->cr[0x07] & 0x10) << 4) |
 //        ((s->cr[0x09] & 0x40) << 3);
@@ -817,7 +877,7 @@ static void vga_graphic_refresh(VGAState *s,
         start_addr = s->vbe_start_addr;
 //        line_compare = 65535;
     }
-    uint32_t addr1 = 4 * start_addr;
+    uint32_t addr1 = (4 << cga2) * start_addr;
     if (s->card_type == VGA_CARD_CIRRUS) {
         uint32_t vram_mask = cirrus_get_vram_wrap_mask(s);
         addr1 &= vram_mask;
@@ -890,6 +950,43 @@ static void vga_graphic_refresh(VGAState *s,
         }
     }
 
+#ifdef DEBUG_BAND
+    if (shift_control == 0 && !vbe_enabled(s) && w == 640 && h == 480 &&
+        line_offset == 320) {
+        static int prev_anom = -1;
+        int anom = 0, fy = -1, ly = -1;
+        for (int y = 0; y < 480; y++) {
+            uint32_t a = addr1 + y * 320;
+            if (a + 4 <= (uint32_t)s->vga_ram_size &&
+                vram[a] == 0x20 && vram[a + 1] == 0x07) {
+                anom++;
+                if (fy < 0)
+                    fy = y;
+                ly = y;
+            }
+        }
+        if (anom != prev_anom) {
+            printf("BAND_ANOM rows=%d->%d y=[%d..%d] row256=%02x,%02x,%02x,%02x "
+                   "op=%llu cnt=[pl=%u oe=%u c4=%u w16=%u w32=%u str=%u]\n",
+                   prev_anom, anom, fy, ly,
+                   vram[0x14000], vram[0x14001], vram[0x14002], vram[0x14003],
+                   (unsigned long long)band_op,
+                   band_cnt[0], band_cnt[1], band_cnt[2],
+                   band_cnt[3], band_cnt[4], band_cnt[5]);
+            printf("BAND_OFFSCR");
+            static const uint32_t smp[] = {0x9600,0x9680,0x9700,0x9800,0xa000,
+                                           0xb000,0xc000,0xc800,0xd000,0xe000,
+                                           0xf000,0xffc0};
+            for (unsigned i = 0; i < sizeof(smp)/sizeof(smp[0]); i++) {
+                if (smp[i] * 4 + 4 <= (uint32_t)s->vga_ram_size)
+                    printf(" %05x=%08x", smp[i], ((uint32_t *)vram)[smp[i]]);
+            }
+            printf("\n");
+            band_reads_dump();
+            prev_anom = anom;
+        }
+    }
+#endif
     int y1 = 0;
     int i0 = 0;
 #if defined(SCALE_3_2) || defined(SCALE_2_1) || defined(SWAPXY)
@@ -963,11 +1060,11 @@ static void vga_graphic_refresh(VGAState *s,
         if (!(s->cr[0x17] & 1)) {
             int shift;
             /* CGA compatibility handling */
-            shift = 14 + ((s->cr[0x17] >> 6) & 1);
+            shift = 14 + cga2 + ((s->cr[0x17] >> 6) & 1);
             addr = (addr & ~(1 << shift)) | ((y1 & 1) << shift);
         }
         if (!(s->cr[0x17] & 2)) {
-            addr = (addr & ~0x8000) | ((y1 & 2) << 14);
+            addr = (addr & ~(0x8000 << cga2)) | ((y1 & 2) << (14 + cga2));
         }
 
         uint32_t color_comp = 0;
@@ -996,7 +1093,7 @@ static void vga_graphic_refresh(VGAState *s,
                     color = palette[k];
                 }
             } else if (shift_control == 1) {
-                int k = ((vram[addr + 4 * (x1 >> 3) + ((x1 & 4) >> 2)] >>
+                int k = ((vram[addr + ((x1 >> 3) << (2 + cga2)) + ((x1 & 4) >> 2)] >>
                           (6 - 2 * (x1 & 3))) & 3);
                 color = palette[k];
             } else
@@ -1573,6 +1670,9 @@ void IRAM_ATTR vga_mem_write16(VGAState *s, uint32_t addr, uint16_t val16)
     mask = (1 << plane);
     if (s->sr[VGA_SEQ_PLANE_WRITE] & mask) {
         * (uint16_t *) &(s->vga_ram[addr]) = val;
+#ifdef DEBUG_BAND
+        band_store_log(s, 3, addr, addr, val, 2);
+#endif
     }
 }
 
@@ -1623,6 +1723,9 @@ void IRAM_ATTR vga_mem_write32(VGAState *s, uint32_t addr, uint32_t val)
     mask = (1 << plane);
     if (s->sr[VGA_SEQ_PLANE_WRITE] & mask) {
         * (uint32_t *) &(s->vga_ram[addr]) = val;
+#ifdef DEBUG_BAND
+        band_store_log(s, 4, addr, addr, val, 4);
+#endif
     }
 }
 
@@ -1669,6 +1772,10 @@ bool IRAM_ATTR vga_mem_write_string(VGAState *s, uint32_t addr, uint8_t *buf, in
     mask = (1 << plane);
     if (s->sr[VGA_SEQ_PLANE_WRITE] & mask) {
         memcpy(s->vga_ram + addr, buf, len);
+#ifdef DEBUG_BAND
+        band_store_log(s, 5, addr, addr,
+                       buf[0] | (len > 1 ? buf[1] << 8 : 0), len);
+#endif
         return true;
     }
     return false;
@@ -1714,17 +1821,27 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
         mask = (1 << plane);
         if (s->sr[VGA_SEQ_PLANE_WRITE] & mask) {
             s->vga_ram[addr] = val;
+#ifdef DEBUG_BAND
+            band_store_log(s, 2, addr, addr, val, 1);
+#endif
         }
     } else if (s->gr[VGA_GFX_MODE] & 0x10) {
         /* odd/even mode (aka text mode mapping) */
         plane = (s->gr[VGA_GFX_PLANE_READ] & 2) | (addr & 1);
         mask = (1 << plane);
         if (s->sr[VGA_SEQ_PLANE_WRITE] & mask) {
-            addr = ((addr & ~1) << 1) | plane;
+#ifdef DEBUG_BAND
+            uint32_t band_in = addr;
+#endif
+            /* see vga_mem_read: plane address = host address, not halved */
+            addr = ((addr & ~1) << 2) | plane;
             if (addr >= s->vga_ram_size) {
                 return;
             }
             s->vga_ram[addr] = val;
+#ifdef DEBUG_BAND
+            band_store_log(s, 1, band_in, addr, val, 1);
+#endif
         }
     } else {
         /* standard VGA latched access */
@@ -1794,9 +1911,31 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
         if (addr * sizeof(uint32_t) >= s->vga_ram_size) {
             return;
         }
+#ifdef DEBUG_BAND
+        {
+            uint32_t band_old = ((uint32_t *)s->vga_ram)[addr];
+            uint32_t band_new = (band_old & ~write_mask) | (val & write_mask);
+            ((uint32_t *)s->vga_ram)[addr] = band_new;
+            band_store_log(s, 0, addr, addr * 4, band_new, 4);
+            if ((band_new & 0xffff) == 0x0720 && (band_old & 0xffff) != 0x0720 &&
+                (band_hit(addr * 4))) {
+                static uint32_t nculprit;
+                nculprit++;
+                if (nculprit <= 400 || (nculprit & 255) == 0) {
+                    printf("BAND_CULPRIT dw=0x%05x(byte=0x%05x) old=%08x new=%08x "
+                           "val=%08x latch=%08x sr2=%02x gr8=%02x gr5=%02x gr3=%02x op=%llu\n",
+                           addr, addr * 4, band_old, band_new, val, s->latch,
+                           s->sr[2], s->gr[8], s->gr[5], s->gr[3],
+                           (unsigned long long)band_op);
+                    band_reads_dump();
+                }
+            }
+        }
+#else
         ((uint32_t *)s->vga_ram)[addr] =
             (((uint32_t *)s->vga_ram)[addr] & ~write_mask) |
             (val & write_mask);
+#endif
     }
 }
 
@@ -1835,7 +1974,16 @@ uint8_t vga_mem_read(VGAState *s, uint32_t addr)
     } else if (s->gr[VGA_GFX_MODE] & 0x10) {
         /* odd/even mode (aka text mode mapping) */
         plane = (s->gr[VGA_GFX_PLANE_READ] & 2) | (addr & 1);
-        addr = ((addr & ~1) << 1) | plane;
+        /* Real VGA: A0 selects the plane and the plane keeps the host
+         * address (A0 substituted by the page bit) - the address is NOT
+         * halved. The halved (QEMU-style) mapping aliases odd/even
+         * accesses at window offsets >= 0xa000 onto the planar pixel
+         * rows 256+ used by 640x480 graphics modes (WFW 3.11 corrupts
+         * the screen through this when caching background-VM text
+         * screens in offscreen plane memory). Interleaved layout:
+         * plane byte a lives at vga_ram[a * 4 + plane]. Like 86Box we
+         * ignore the MSR page-select bit. */
+        addr = ((addr & ~1) << 2) | plane;
         if (addr >= s->vga_ram_size) {
             return 0xff;
         }
@@ -1846,6 +1994,11 @@ uint8_t vga_mem_read(VGAState *s, uint32_t addr)
             return 0xff;
         }
         s->latch = ((uint32_t *)s->vga_ram)[addr];
+#ifdef DEBUG_BAND
+        band_rr_addr[band_rr_i & 7] = addr;
+        band_rr_val[band_rr_i & 7] = s->latch;
+        band_rr_i++;
+#endif
 
         if (!(s->gr[VGA_GFX_MODE] & 0x08)) {
             /* read mode 0 */

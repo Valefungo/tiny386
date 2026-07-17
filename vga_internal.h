@@ -25,6 +25,12 @@ void *pcmalloc(long size);
 //#define DEBUG_VBE
 //#define DEBUG_VGA_REG
 //#define DEBUG_CIRRUS
+/* DEBUG_BAND: traces every VRAM store landing in the watch ranges (vga.c),
+ * used to hunt the Win3.11 stale-band bug; DEBUG_BAND_PC covers the LFB
+ * fast paths in pc.c. Heavy on stdout - can slow the guest enough to trip
+ * Windows-internal timeouts (32-bit disk access), keep off normally. */
+//#define DEBUG_BAND
+//#define DEBUG_BAND_PC
 
 #define MSR_COLOR_EMULATION 0x01
 #define MSR_PAGE_SELECT     0x20

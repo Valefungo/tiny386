@@ -34,6 +34,14 @@
 //#define DEBUG_IDE
 //#define DEBUG_IDE_ATAPI
 //#define DEBUG_IDE_EXTENDED
+/* DEBUG_IDE_HANG: lightweight always-on-when-defined tracing for the
+ * disk corruption/freeze bug (long text file half-corrupted, file
+ * explorer hang on drive C access). Logs every command dispatch and
+ * flags command re-entrancy (a new command written to the command
+ * register while a previous transfer is still mid-flight, DRQ/BUSY
+ * still set) - a real controller would never see that from a
+ * well-behaved driver, so if it happens here it's a strong lead. */
+#define DEBUG_IDE_HANG
 
 /* Bits of HD_STATUS */
 #define ERR_STAT		0x01
@@ -384,6 +392,10 @@ static void ide_sector_read_cb(void *opaque, int ret);
 static void ide_sector_read_cb_end(IDEState *s);
 static void ide_sector_write_cb2(void *opaque, int ret);
 
+#ifdef DEBUG_IDE_HANG
+static uint64_t idehang_op;
+#endif
+
 static void padstr(char *str, const char *src, int len)
 {
     int i, v;
@@ -505,10 +517,29 @@ static void ide_abort_command(IDEState *s)
     s->error = ABRT_ERR;
 }
 
-static void ide_set_irq(IDEState *s) 
+#ifdef DEBUG_IDE_HANG
+static int idehang_irq_line;      /* shadow of the IDE IRQ line level */
+static uint64_t idehang_irq_raises, idehang_irq_lost, idehang_irq_acks;
+static uint64_t idehang_altstatus_reads;
+#endif
+
+static void ide_set_irq(IDEState *s)
 {
     IDEIFState *ide_if = s->ide_if;
     if (!(ide_if->cmd & IDE_CMD_DISABLE_IRQ)) {
+#ifdef DEBUG_IDE_HANG
+        idehang_irq_raises++;
+        if (idehang_irq_line) {
+            idehang_irq_lost++;
+            printf("IDEHANG *** IRQ RAISED WHILE LINE ALREADY HIGH (edge lost) *** "
+                   "raises=%llu lost=%llu acks=%llu status=0x%02x data_index=%d data_end=%d\n",
+                   (unsigned long long)idehang_irq_raises,
+                   (unsigned long long)idehang_irq_lost,
+                   (unsigned long long)idehang_irq_acks,
+                   s->status, s->data_index, s->data_end);
+        }
+        idehang_irq_line = 1;
+#endif
         ide_if->set_irq(ide_if->pic, ide_if->irq, 1);
     }
 }
@@ -633,8 +664,17 @@ static void ide_sector_read_cb(void *opaque, int ret)
     IDEState *s = opaque;
     int n;
     EndTransferFunc *func;
-    
+
     n = s->io_nb_sectors;
+#ifdef DEBUG_IDE_HANG
+    printf("IDEHANG read_cb op=%llu sector=%" PRId64 " n=%d ret=%d nsector_before=%d "
+           "first16=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+           (unsigned long long)idehang_op, ide_get_sector(s), n, ret, s->nsector,
+           s->io_buffer[0], s->io_buffer[1], s->io_buffer[2], s->io_buffer[3],
+           s->io_buffer[4], s->io_buffer[5], s->io_buffer[6], s->io_buffer[7],
+           s->io_buffer[8], s->io_buffer[9], s->io_buffer[10], s->io_buffer[11],
+           s->io_buffer[12], s->io_buffer[13], s->io_buffer[14], s->io_buffer[15]);
+#endif
     ide_set_sector(s, ide_get_sector(s) + n);
     s->nsector = (s->nsector - n) & 0xff;
     if (s->nsector == 0)
@@ -725,10 +765,39 @@ static void ide_identify_cb(IDEState *s)
     s->status = READY_STAT;
 }
 
+#ifdef DEBUG_IDE_HANG
+static void idehang_log_cmd(IDEState *s, int val)
+{
+    idehang_op++;
+    int reentrant = (s->status & (BUSY_STAT | DRQ_STAT)) != 0;
+    printf("IDEHANG cmd op=%llu val=0x%02x sector=%" PRId64 " nsector=%d "
+           "mult=%d status_before=0x%02x reentrant=%d data_index=%d data_end=%d\n",
+           (unsigned long long)idehang_op, val, ide_get_sector(s), s->nsector,
+           s->mult_sectors, s->status, reentrant, s->data_index, s->data_end);
+    if (reentrant) {
+        printf("IDEHANG *** command written while BUSY/DRQ still set - "
+               "previous transfer (data_index=%d/%d) was not finished ***\n",
+               s->data_index, s->data_end);
+    }
+    if ((idehang_op % 200) == 0) {
+        printf("IDEHANG SUMMARY op=%llu irq_raises=%llu irq_lost=%llu irq_acks=%llu "
+               "altstatus_reads=%llu\n",
+               (unsigned long long)idehang_op,
+               (unsigned long long)idehang_irq_raises,
+               (unsigned long long)idehang_irq_lost,
+               (unsigned long long)idehang_irq_acks,
+               (unsigned long long)idehang_altstatus_reads);
+    }
+}
+#endif
+
 static void ide_exec_cmd(IDEState *s, int val)
 {
 #if defined(DEBUG_IDE)
     printf("ide: exec_cmd=0x%02x\n", val);
+#endif
+#ifdef DEBUG_IDE_HANG
+    idehang_log_cmd(s, val);
 #endif
     switch(val) {
     case WIN_IDENTIFY:
@@ -1640,6 +1709,12 @@ uint32_t ide_ioport_read(void *opaque, uint32_t addr)
         default:
         case 7:
             ret = s->status;
+#ifdef DEBUG_IDE_HANG
+            idehang_irq_acks++;
+            idehang_irq_line = 0;
+            printf("IDEHANG status_read acks=%llu status=0x%02x data_index=%d data_end=%d\n",
+                   (unsigned long long)idehang_irq_acks, ret, s->data_index, s->data_end);
+#endif
             s1->set_irq(s1->pic, s1->irq, 0);
             break;
         }
@@ -1661,6 +1736,9 @@ uint32_t ide_status_read(void *opaque)
     } else {
         ret = 0;
     }
+#ifdef DEBUG_IDE_HANG
+    idehang_altstatus_reads++;
+#endif
 #ifdef DEBUG_IDE
     printf("ide: read status=0x%02x\n", ret);
 #endif
@@ -1924,6 +2002,9 @@ typedef enum {
 typedef struct BlockDeviceFile {
     FILE *f;
     int start_offset;
+#ifdef DEBUG_IDE_HANG
+    char filename[256];
+#endif
     int cylinders, heads, sectors;
     int64_t nb_sectors;
     BlockDeviceModeEnum mode;
@@ -1977,7 +2058,49 @@ static int bf_read_async(BlockDevice *bs,
         }
     } else {
         fseeko(bf->f, bf->start_offset + sector_num * SECTOR_SIZE, SEEK_SET);
+#ifdef DEBUG_IDE_HANG
+        size_t got = fread(buf, 1, n * SECTOR_SIZE, bf->f);
+        if (got != (size_t)(n * SECTOR_SIZE)) {
+            printf("IDEHANG *** SHORT READ *** sector=%" PRId64 " n=%d wanted=%d got=%zu "
+                   "feof=%d ferror=%d\n",
+                   sector_num, n, n * SECTOR_SIZE, got, feof(bf->f), ferror(bf->f));
+        }
+        /* independent cross-check: reread the same range via a second,
+         * unrelated FILE* and diff. If this ever disagrees with what
+         * just went into buf, the bug is upstream of the file (state
+         * corruption in IDEState/io_buffer before this point); if it
+         * always agrees, the bug is downstream (PIO handoff to the
+         * guest, or the guest driver itself). */
+        {
+            static FILE *check_f;
+            static int tried;
+            if (!check_f && !tried) {
+                tried = 1;
+                check_f = fopen(bf->filename, "rb");
+            }
+            if (check_f) {
+                static uint8_t check_buf[64 * SECTOR_SIZE];
+                fseeko(check_f, bf->start_offset + sector_num * SECTOR_SIZE, SEEK_SET);
+                size_t got2 = fread(check_buf, 1, n * SECTOR_SIZE, check_f);
+                if (got2 != (size_t)(n * SECTOR_SIZE) ||
+                    memcmp(check_buf, buf, n * SECTOR_SIZE) != 0) {
+                    int i, firstdiff = -1;
+                    for (i = 0; i < n * SECTOR_SIZE && i < (int)got2; i++) {
+                        if (check_buf[i] != buf[i]) { firstdiff = i; break; }
+                    }
+                    printf("IDEHANG *** MISMATCH vs independent reread *** sector=%" PRId64
+                           " n=%d got2=%zu firstdiff_byte=%d (sector_offset=%d) "
+                           "buf=%02x check=%02x\n",
+                           sector_num, n, got2, firstdiff,
+                           firstdiff >= 0 ? firstdiff % SECTOR_SIZE : -1,
+                           firstdiff >= 0 ? buf[firstdiff] : 0,
+                           firstdiff >= 0 ? check_buf[firstdiff] : 0);
+                }
+            }
+        }
+#else
         fread(buf, 1, n * SECTOR_SIZE, bf->f);
+#endif
     }
     /* synchronous read */
     return 0;
@@ -2061,6 +2184,9 @@ static BlockDevice *block_device_init(const char *filename,
     bf->nb_sectors = file_size / 512;
     bf->f = f;
     bf->start_offset = start_offset;
+#ifdef DEBUG_IDE_HANG
+    snprintf(bf->filename, sizeof(bf->filename), "%s", filename);
+#endif
 
     if (mode == BF_MODE_SNAPSHOT) {
         bf->sector_table = pcmalloc(sizeof(bf->sector_table[0]) *

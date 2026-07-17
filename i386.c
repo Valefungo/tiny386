@@ -5193,6 +5193,20 @@ long IRAM_ATTR cpui386_get_cycle(CPUI386 *cpu)
 	return cpu->cycle;
 }
 
+/* one-line CPU state snapshot for the host-side freeze watchdog */
+void cpui386_dump_state(CPUI386 *cpu)
+{
+	fprintf(stderr,
+		"watchdog: cs:ip=%04x:%08x ss:sp=%04x:%08x flags=%08x cpl=%d halt=%d "
+		"ax=%08x bx=%08x cx=%08x dx=%08x si=%08x di=%08x cr0=%08x cycle=%ld\n",
+		(unsigned)cpu->seg[SEG_CS].sel, (unsigned)cpu->ip,
+		(unsigned)cpu->seg[SEG_SS].sel, (unsigned)REGi(4),
+		(unsigned)cpu->flags, cpu->cpl, (int)cpu->halt,
+		(unsigned)REGi(0), (unsigned)REGi(3), (unsigned)REGi(1),
+		(unsigned)REGi(2), (unsigned)REGi(6), (unsigned)REGi(7),
+		(unsigned)cpu->cr0, (long)cpu->cycle);
+}
+
 CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 {
 	CPUI386 *cpu = malloc(sizeof(CPUI386));

@@ -3,8 +3,12 @@
 #include <string.h>
 #include <errno.h>
 #include <assert.h>
+#include <unistd.h>
 #include "pc.h"
 #include "osd/osd.h"
+
+/* periodic guest CS:IP snapshots on stderr, for diagnosing freezes */
+#define DEBUG_WATCHDOG
 
 #define CNFG_IMPLEMENTATION
 #include "CNFG.h"
@@ -280,6 +284,8 @@ static void usage(const char *argv0)
 
 int main(int argc, char *argv[])
 {
+	if (!isatty(fileno(stdout)))
+		setvbuf(stdout, NULL, _IOLBF, 0);
 	PCConfig conf;
 	memset(&conf, 0, sizeof(conf));
 	conf.mem_size = 8 * 1024 * 1024;
@@ -337,10 +343,22 @@ int main(int argc, char *argv[])
 	load_bios_and_reset(pc);
 
 	pc->boot_start_time = get_uticks();
+#ifdef DEBUG_WATCHDOG
+	uint32_t wd_last = get_uticks();
+#endif
 	for (; pc->shutdown_state != 8 && console->cnfgret;) {
 		pc_step(pc);
 		cnfgpoll(console);
 		pc_vga_step(pc);
+#ifdef DEBUG_WATCHDOG
+		/* periodic guest CS:IP snapshot: if the emulator window
+		 * "freezes", the log tail shows where the guest is spinning
+		 * (lines keep coming = guest loop; lines stop = host hang) */
+		if (!enable_kvm && (uint32_t)(get_uticks() - wd_last) >= 2000000) {
+			wd_last = get_uticks();
+			cpui386_dump_state(pc->cpu);
+		}
+#endif
 	}
 	return 0;
 }

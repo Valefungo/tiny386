@@ -678,6 +678,22 @@ static inline bool cirrus_mmio_abs_hit(PC *pc, uword raw_addr, uint32_t *off)
 	return true;
 }
 
+/* DEBUG_BAND (see vga.c): log LFB fast-path stores landing in the watch
+ * ranges, to prove/disprove this path during the Win3.11 band corruption. */
+//#define DEBUG_BAND_PC
+#ifdef DEBUG_BAND_PC
+static void band_lfb_log(const char *tag, uword addr, uint32_t val, int n)
+{
+	if (!((addr >= 0x14000 && addr < 0x20400) ||
+	      (addr >= 0x25800 && addr < 0x40000)))
+		return;
+	static int nlog;
+	if (nlog++ < 400)
+		printf("BAND_LFB %s dst=0x%05x val=0x%08x n=%d\n",
+		       tag, (uint32_t)addr, val, n);
+}
+#endif
+
 static u8 iomem_read8(void *iomem, uword addr)
 {
 	PC *pc = iomem;
@@ -721,6 +737,9 @@ static void iomem_write8(void *iomem, uword addr, u8 val)
 				fprintf(stderr, "lfb_write8 off=0x%x val=0x%02x n=%d\n", addr, val, n);
 #endif
 			pc->vga_mem[addr] = val;
+#ifdef DEBUG_BAND_PC
+			band_lfb_log("w8", addr, val, 1);
+#endif
 		}
 		return;
 	}
@@ -769,6 +788,9 @@ static void iomem_write16(void *iomem, uword addr, u16 val)
 				fprintf(stderr, "lfb_write16 off=0x%x val=0x%04x n=%d\n", addr, val, n);
 #endif
 			*(uint16_t *)&(pc->vga_mem[addr]) = val;
+#ifdef DEBUG_BAND_PC
+			band_lfb_log("w16", addr, val, 2);
+#endif
 		}
 		return;
 	}
@@ -817,6 +839,9 @@ static void iomem_write32(void *iomem, uword addr, u32 val)
 				fprintf(stderr, "lfb_write32 off=0x%x val=0x%08x n=%d\n", addr, val, n);
 #endif
 			*(uint32_t *)&(pc->vga_mem[addr]) = val;
+#ifdef DEBUG_BAND_PC
+			band_lfb_log("w32", addr, val, 4);
+#endif
 		}
 		return;
 	}
@@ -857,6 +882,10 @@ static bool iomem_write_string(void *iomem, uword addr, uint8_t *buf, int len)
 				fprintf(stderr, "lfb_write_string off=0x%x len=%d n=%d\n", addr, len, n);
 #endif
 			memcpy(pc->vga_mem + addr, buf, len);
+#ifdef DEBUG_BAND_PC
+			band_lfb_log("wstr", addr,
+				     buf[0] | (len > 1 ? buf[1] << 8 : 0), len);
+#endif
 			return true;
 		}
 		return false;
