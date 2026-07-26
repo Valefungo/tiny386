@@ -41,7 +41,7 @@
  * register while a previous transfer is still mid-flight, DRQ/BUSY
  * still set) - a real controller would never see that from a
  * well-behaved driver, so if it happens here it's a strong lead. */
-#define DEBUG_IDE_HANG
+//#define DEBUG_IDE_HANG
 
 /* Bits of HD_STATUS */
 #define ERR_STAT		0x01

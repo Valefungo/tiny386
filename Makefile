@@ -1,6 +1,7 @@
 Q = @
 CC_ = gcc
-CC_win32 = i686-w64-mingw32-gcc
+# CC_win32 = i686-w64-mingw32-gcc
+CC_win32 = gcc
 CC = ${CC_${PLAT}}
 HOSTCC = ${CC}
 
@@ -36,11 +37,11 @@ CFLAGS += ${CFLAGS_GLIBC_FIX}
 LIBS += ${LIBS_GLIBC_FIX}
 
 LIBS_SDL_ = `${SDL_CONFIG} --libs` ${LIBS}
-LIBS_SDL_win32 = `${SDL_CONFIG} --libs` ${LIBS}
+LIBS_SDL_win32 = `${SDL_CONFIG} --libs` -lws2_32 ${LIBS}
 LIBS_SDL = ${LIBS_SDL_${PLAT}}
 
 LIBS_RAWDRAW_ = -ldl ${LIBS}
-LIBS_RAWDRAW_win32 = -lgdi32 -lwinmm ${LIBS}
+LIBS_RAWDRAW_win32 = -lgdi32 -lwinmm -lws2_32 ${LIBS}
 LIBS_RAWDRAW = ${LIBS_RAWDRAW_${PLAT}}
 
 #USE_SDL = y/n
@@ -59,7 +60,7 @@ CFLAGS_CPUABS_y = -DUSE_CPUABS
 CFLAGS += ${CFLAGS_CPUABS_${USE_CPUABS}}
 
 #USE_SLIRP = y/n
-USE_SLIRP = y
+USE_SLIRP = n
 CFLAGS_SLIRP_y = -DUSE_SLIRP ${SLIRP_INC}
 LIBS_SLIRP_y_ = ${SLIRP_LIB}
 LIBS_SLIRP_y_win32 = ${SLIRP_LIB} -lws2_32 -liphlpapi
