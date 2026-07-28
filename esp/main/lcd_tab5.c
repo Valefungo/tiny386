@@ -214,6 +214,21 @@ void ps2_mouse_event(PS2MouseState *s, int dx, int dy, int dz, int buttons_state
 void lcd_draw(int x_start, int y_start, int x_end, int y_end, void *src)
 {
 	if (globals.panel) {
+		/* Undo the vertical half of the SS-bit 180 degree rotation (see
+		 * vga_task()) by reversing pixel order within each native row.
+		 * Confirmed correct: combined with SS alone, this reproduces the
+		 * pre-mirror baseline (horizontal-mirror only) exactly. */
+		int row_w = x_end - x_start;
+		int rows = y_end - y_start;
+		uint16_t *p = (uint16_t *) src;
+		for (int r = 0; r < rows; r++) {
+			uint16_t *row = p + r * row_w;
+			for (int a = 0, b = row_w - 1; a < b; a++, b--) {
+				uint16_t t = row[a];
+				row[a] = row[b];
+				row[b] = t;
+			}
+		}
 		ESP_ERROR_CHECK(
 			esp_lcd_panel_draw_bitmap(globals.panel, x_start, y_start, x_end, y_end, src));
 	}
@@ -404,6 +419,14 @@ void vga_task(void *arg)
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
 	ESP_ERROR_CHECK(esp_lcd_dpi_panel_enable_dma2d(panel));
 #endif
+	/* GS always corrupts pixel data in groups of 4 on this panel (confirmed
+	 * independent of DMA2D), so it can't be used. SS-only is the only clean
+	 * MADCTL state, but it's a full 180 degree rotation (both axes flipped)
+	 * relative to the wanted image. Undo it entirely in software instead:
+	 * the vertical-axis half is fixed here (reverse pixel order within each
+	 * native row); the horizontal-axis half is fixed in redraw() (feeds
+	 * this function the mirrored source chunk, see USE_LCD_TAB5 there). */
+	ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel, false, true));
 	ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
 
 	backlight_on();

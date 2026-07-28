@@ -1126,6 +1126,8 @@ static long parse_mem_size(const char *value)
 {
 	int len = strlen(value);
 	long a = atol(value);
+//	if (a > 16)
+//		a = 16;
 	if (len) {
 		switch (value[len - 1]) {
 		case 'G': a *= 1024 * 1024 * 1024; break;

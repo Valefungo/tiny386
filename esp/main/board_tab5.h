@@ -2,7 +2,8 @@
 // external M5 I2C keyboard. Requires esp-idf v6.0.x (same as jc4880p443).
 #define BUILD_ESP32
 
-#define PSRAM_ALLOC_LEN (10 * 1024 * 1024)
+// MAX PSRAM is 32MB, allocate 28 MB for system and reserve max 2M for video memory
+#define PSRAM_ALLOC_LEN ((30 * 1024 * 1024) - (2 * 1024 * 1024))
 
 #define IRAM_ATTR_CPU_EXEC1
 

@@ -8,7 +8,7 @@
 #include "osd/osd.h"
 
 /* periodic guest CS:IP snapshots on stderr, for diagnosing freezes */
-#define DEBUG_WATCHDOG
+#undef DEBUG_WATCHDOG
 
 #define CNFG_IMPLEMENTATION
 #include "CNFG.h"

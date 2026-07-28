@@ -100,6 +100,10 @@ struct KBDState {
     uint8_t mode;
     /* Bitmask of devices with data available.  */
     uint8_t pending;
+    /* Which device's byte currently owns the single-slot output buffer
+     * (0, KBD_PENDING_KBD or KBD_PENDING_AUX) - sticky until that device's
+     * queue is drained, see kbd_update_irq(). */
+    uint8_t obf_owner;
     PS2KbdState *kbd;
     PS2MouseState *mouse;
 
@@ -130,18 +134,34 @@ static void kbd_update_irq(KBDState *s)
     irq_kbd_level = 0;
     irq_mouse_level = 0;
     s->status &= ~(KBD_STAT_OBF | KBD_STAT_MOUSE_OBF);
-    if (s->pending) {
+
+    /* The real 8042 has a single-byte output buffer: once a device's byte
+     * is latched into it, that byte (and its OBF/AUXDATA status) has to
+     * stay presented until it's read, even if the other device's queue
+     * also becomes non-empty in the meantime. Deciding priority fresh from
+     * `pending` on every call - kbd always wins ties - starves the other
+     * device indefinitely whenever both queues happen to be simultaneously
+     * non-empty at update time, which only matters here because on the
+     * ESP32/THREAD_SAFE build IRQs are flushed periodically from
+     * kbd_step() rather than synchronously per byte (see ps2_queue()). */
+    if (s->obf_owner && !(s->pending & s->obf_owner))
+        s->obf_owner = 0;
+    if (!s->obf_owner) {
+        if (s->pending & KBD_PENDING_KBD)
+            s->obf_owner = KBD_PENDING_KBD;
+        else if (s->pending & KBD_PENDING_AUX)
+            s->obf_owner = KBD_PENDING_AUX;
+    }
+
+    if (s->obf_owner == KBD_PENDING_AUX) {
+        s->status |= KBD_STAT_OBF | KBD_STAT_MOUSE_OBF;
+        if (s->mode & KBD_MODE_MOUSE_INT)
+            irq_mouse_level = 1;
+    } else if (s->obf_owner == KBD_PENDING_KBD) {
         s->status |= KBD_STAT_OBF;
-        /* kbd data takes priority over aux data.  */
-        if (s->pending == KBD_PENDING_AUX) {
-            s->status |= KBD_STAT_MOUSE_OBF;
-            if (s->mode & KBD_MODE_MOUSE_INT)
-                irq_mouse_level = 1;
-        } else {
-            if ((s->mode & KBD_MODE_KBD_INT) &&
-                !(s->mode & KBD_MODE_DISABLE_KBD))
-                irq_kbd_level = 1;
-        }
+        if ((s->mode & KBD_MODE_KBD_INT) &&
+            !(s->mode & KBD_MODE_DISABLE_KBD))
+            irq_kbd_level = 1;
     }
     s->set_irq(s->pic, s->irq_kbd, irq_kbd_level);
     s->set_irq(s->pic, s->irq_mouse, irq_mouse_level);
@@ -264,7 +284,7 @@ uint32_t kbd_read_data(void *opaque, uint32_t addr)
 {
     KBDState *s = opaque;
     uint32_t val;
-    if (s->pending == KBD_PENDING_AUX)
+    if (s->obf_owner == KBD_PENDING_AUX)
         val = ps2_read_data(s->mouse);
     else
         val = ps2_read_data(s->kbd);

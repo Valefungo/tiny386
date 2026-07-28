@@ -111,14 +111,33 @@ Console *console_init(int width, int height)
 }
 
 void lcd_draw(int x_start, int y_start, int x_end, int y_end, void *src);
-static void redraw(void *opaque,
-		   int x, int y, int w, int h)
+static void redraw(void *opaque, int x, int y, int w, int h)
 {
 	Console *s = opaque;
 	for (int i = 0; i < NN; i++) {
+#ifdef USE_LCD_TAB5
+		/* Undo the horizontal half of the SS-bit 180 degree rotation
+		 * (see vga_task() in lcd_tab5.c): feed this fixed, sequential
+		 * destination strip the mirrored source chunk, with its rows
+		 * ALSO reversed internally. Swapping just the chunk (without
+		 * reversing rows within it) only reverses at 40-row block
+		 * granularity, not per native row - leaves a residual mirror. */
+		const int rows_per_chunk = LCD_WIDTH / NN;
+		const int row_pixels = LCD_HEIGHT;
+		int chunk = NN - 1 - i;
+		uint16_t *src_base = (uint16_t *) s->fb;
+		src_base += row_pixels * rows_per_chunk * chunk;
+		uint16_t *dst_base = (uint16_t *) s->fb1;
+		for (int r = 0; r < rows_per_chunk; r++) {
+			memcpy(dst_base + r * row_pixels,
+			       src_base + (rows_per_chunk - 1 - r) * row_pixels,
+			       row_pixels * 2);
+		}
+#else
 		uint16_t *src = (uint16_t *) s->fb;
 		src += LCD_WIDTH * LCD_HEIGHT / NN * i;
 		memcpy(s->fb1, src, LCD_WIDTH * LCD_HEIGHT / NN * 2);
+#endif
 		lcd_draw(0, LCD_WIDTH / NN * i,
 			 LCD_HEIGHT, LCD_WIDTH / NN * (i + 1),
 			 s->fb1);
@@ -199,6 +218,7 @@ static void i386_task(void *arg)
 static char *psram;
 static long psram_off;
 static long psram_len;
+
 void *psmalloc(long size)
 {
 	void *ret = psram + psram_off;
@@ -265,7 +285,6 @@ void app_main(void)
 	i2s_main();
 	storage_init();
 
-	esp_psram_init();
 #ifndef PSRAM_ALLOC_LEN
 	// use the whole psram
 	size_t len;
